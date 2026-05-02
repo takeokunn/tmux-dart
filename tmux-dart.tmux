@@ -33,6 +33,10 @@ build_binary() {
 }
 
 ensure_binary() {
+  if [ -n "${TMUX_DART_BINARY:-}" ]; then
+    printf '%s' "$TMUX_DART_BINARY"
+    return
+  fi
   local bin="$CURRENT_DIR/result/bin/tmux-dart"
   if [ ! -x "$bin" ]; then
     build_binary
@@ -107,7 +111,9 @@ case "${1:-}" in
     run_jump_with_char "${2:-}"
     ;;
   "")
-    build_binary
+    if [ -z "${TMUX_DART_BINARY:-}" ]; then
+      build_binary
+    fi
     tmux bind-key -N "Jump to pane location in copy mode" "$(get_tmux_option "@jump-key" "j")" run-shell -b "$CURRENT_DIR/tmux-dart.tmux --prompt"
     ;;
   *)
