@@ -14,6 +14,9 @@ use tmux_dart::{
     },
 };
 
+const JUMP_USAGE: &str =
+    "usage: tmux-dart jump (--char <char> | --char-file <path>) [--pane-id <pane>]";
+
 #[derive(Debug, Clone)]
 struct JumpOptions {
     label_keys: Vec<char>,
@@ -67,16 +70,14 @@ fn run() -> Result<()> {
             } else if let Some(path) = jump_char_file {
                 read_initial_char_from_file(&path)?
             } else {
-                bail!(
-                    "usage: tmux-dart jump (--char <char> | --char-file <path>) [--pane-id <pane>]"
-                )
+                bail!("{JUMP_USAGE}")
             };
             let Some(jump_char) = jump_char else {
                 return Ok(());
             };
             run_jump(jump_char, explicit_pane_id)
         }
-        _ => bail!("usage: tmux-dart jump (--char <char> | --char-file <path>) [--pane-id <pane>]"),
+        _ => bail!("{JUMP_USAGE}"),
     }
 }
 
@@ -189,14 +190,7 @@ fn select_position_index(
     ) else {
         return Ok(None);
     };
-    let remaining = positions
-        .get(subset.clone())
-        .map(<[_]>::to_vec)
-        .unwrap_or_default();
-    if remaining.is_empty() {
-        return Ok(None);
-    }
-
-    let lower_index = select_position_index(pane, screen, &remaining, style, options)?;
+    let remaining = &positions[subset.clone()];
+    let lower_index = select_position_index(pane, screen, remaining, style, options)?;
     Ok(lower_index.map(|value| subset.start + value))
 }

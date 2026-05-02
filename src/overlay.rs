@@ -9,8 +9,9 @@ use crate::{
 
 const CLEAR_SEQ: &str = "\u{1b}[2J";
 const HOME_SEQ: &str = "\u{1b}[H";
+const CLEAR_HOME_SEQ: &str = concat!("\u{1b}[2J", "\u{1b}[H");
 const RESET_COLORS: &str = "\u{1b}[0m";
-const ENTER_ALTERNATE_SCREEN: &str = "\u{1b}[?1049h";
+const ENTER_ALTERNATE_HOME_SEQ: &str = concat!("\u{1b}[?1049h", "\u{1b}[H");
 const RESTORE_NORMAL_SCREEN: &str = "\u{1b}[?1049l";
 
 #[derive(Debug, Clone)]
@@ -39,10 +40,7 @@ fn with_normal_screen_restore<T, F>(pane: &PaneState, action: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
-    append_to_tty(
-        &pane.tty_path,
-        &(ENTER_ALTERNATE_SCREEN.to_owned() + HOME_SEQ),
-    )?;
+    append_to_tty(&pane.tty_path, ENTER_ALTERNATE_HOME_SEQ)?;
     let result = action();
     append_to_tty(&pane.tty_path, RESTORE_NORMAL_SCREEN)?;
     result
@@ -53,7 +51,7 @@ where
     F: FnOnce() -> Result<T>,
 {
     let saved_screen = capture_pane_with_escapes(&pane.pane_id)?;
-    append_to_tty(&pane.tty_path, &(CLEAR_SEQ.to_owned() + HOME_SEQ))?;
+    append_to_tty(&pane.tty_path, CLEAR_HOME_SEQ)?;
     let result = action();
 
     let mut restore = String::from(RESET_COLORS);
@@ -89,8 +87,7 @@ fn render_overlay(
     style: &OverlayStyle,
 ) -> String {
     let mut rendered = String::new();
-    rendered.push_str(CLEAR_SEQ);
-    rendered.push_str(HOME_SEQ);
+    rendered.push_str(CLEAR_HOME_SEQ);
     rendered.push_str(&style.background);
     rendered.push_str(&screen.replace('\n', "\n\r"));
 

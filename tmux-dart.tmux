@@ -50,6 +50,14 @@ export_jump_env() {
   export JUMP_AUTO_JUMP="$(get_tmux_option '@jump-auto-jump' 'on')"
 }
 
+run_tmux_dart_jump() {
+  local bin
+
+  export_jump_env
+  bin="$(ensure_binary)"
+  "$bin" jump "$@"
+}
+
 prompt_initial_char() {
   local jump_char_file="$1"
   local quoted_jump_char_file
@@ -67,11 +75,7 @@ run_jump_with_char() {
     exit 0
   fi
 
-  local bin
-
-  export_jump_env
-  bin="$(ensure_binary)"
-  "$bin" jump --char "$1"
+  run_tmux_dart_jump --char "$1"
 }
 
 run_jump_with_char_file() {
@@ -80,11 +84,7 @@ run_jump_with_char_file() {
     exit 1
   fi
 
-  local bin
-
-  export_jump_env
-  bin="$(ensure_binary)"
-  "$bin" jump --char-file "$1"
+  run_tmux_dart_jump --char-file "$1"
 }
 
 prompt_and_run_jump() {
