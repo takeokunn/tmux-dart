@@ -4,6 +4,8 @@ Rust rewrite of `tmux-jump`: an EasyMotion-like cursor jump plugin for tmux.
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
+![screenshot](./screenshot.png)
+
 ## Features
 
 - tmux plugin entrypoint via `tmux-dart.tmux`
