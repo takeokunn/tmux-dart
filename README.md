@@ -60,16 +60,27 @@ characters), and `line` (first non-blank character on each matching line).
 least two unique non-whitespace characters; otherwise tmux-dart falls back to
 `jfhgkdlsa`.
 
-## Build
+## Development
+
+Enter the development shell:
 
 ```bash
 nix develop
-tmux-dart-check
 ```
 
-`nix run .#check` runs the same Nix verification without entering the shell. Use
-`nix run .#smoke` for only the tmux smoke test, and `nix flake check` for
-sandboxed checks.
+Run all checks (shell syntax, formatting, and package build):
+
+```bash
+nix flake check
+```
+
+Test the plugin interactively inside a clean tmux session:
+
+```bash
+tmux -L tmux-dart-clean -f /dev/null new-session -d \; run-shell "$(pwd)/tmux-dart.tmux" \; attach-session
+# Press prefix + j inside tmux. Clean up from another shell when done:
+tmux -L tmux-dart-clean kill-server
+```
 
 ## License
 

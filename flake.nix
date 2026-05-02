@@ -28,7 +28,19 @@
         };
     in
     {
-      formatter = forAllSystemsWith (pkgs: pkgs.nixfmt);
+      formatter = forAllSystemsWith (pkgs:
+        pkgs.writeShellApplication {
+          name = "fmt";
+          runtimeInputs = with pkgs; [
+            cargo
+            nixfmt
+            rustfmt
+          ];
+          text = ''
+            nixfmt "$@"
+            cargo fmt
+          '';
+        });
 
       checks = forAllSystemsWith (pkgs: {
         default =
