@@ -39,6 +39,7 @@
           name = "tmux-dart-smoke";
           runtimeInputs = [
             pkgs.coreutils
+            pkgs.expect
             pkgs.tmux
           ];
           text = ''
@@ -85,6 +86,46 @@
               *qzxvword*) ;;
               *)
                 printf 'tmux-dart smoke failed: pane content missing qzxvword\n' >&2
+                exit 1
+                ;;
+            esac
+
+            multi_socket="tmux_dart_multi_$$"
+            multi_stdout="$(mktemp)"
+            multi_stderr="$(mktemp)"
+            multi_rc="$(mktemp)"
+            cleanup_multi() {
+              tmux -L "$multi_socket" kill-server >/dev/null 2>&1 || true
+              rm -f "$multi_stdout" "$multi_stderr" "$multi_rc"
+            }
+            trap 'rm -f "$jump_char_file"; cleanup_multi; cleanup' EXIT
+
+            tmux -L "$multi_socket" -f /dev/null new-session -d "sh -lc 'printf \"tmux tmux tmux\\n\"; exec cat'"
+            multi_pane_id="$(tmux -L "$multi_socket" display-message -p '#{pane_id}')"
+            tmux -L "$multi_socket" bind-key j run-shell -b "sh -lc 'JUMP_BACKGROUND_COLOR='\'''\e[0m\e[32m'\''' JUMP_FOREGROUND_COLOR='\'''\e[1m\e[31m'\''' JUMP_KEYS_POSITION=left ${tmuxDart}/bin/tmux-dart jump --char t --pane-id $multi_pane_id >$multi_stdout 2>$multi_stderr; printf %s \\$? >$multi_rc'"
+
+            expect -c "spawn tmux -L $multi_socket attach-session; after 500; send \"\002j\"; after 2000; send \"f\"; after 1500; send \"\002d\"; expect eof" >/dev/null 2>&1 || true
+
+            multi_state="$(tmux -L "$multi_socket" display-message -p -t "$multi_pane_id" '#{pane_in_mode};#{pane_mode};#{copy_cursor_x};#{copy_cursor_y}')"
+            multi_content="$(tmux -L "$multi_socket" capture-pane -p -t "$multi_pane_id")"
+            multi_exit="$(cat "$multi_rc" 2>/dev/null || true)"
+            multi_error="$(cat "$multi_stderr" 2>/dev/null || true)"
+
+            printf 'MULTI_STATE<<%s>>\nMULTI_AFTER<<%s>>\n' "$multi_state" "$multi_content"
+
+            if [ "$multi_exit" != '0' ] || [ -n "$multi_error" ]; then
+              printf 'tmux-dart smoke failed: multi-match command failed: rc=%s stderr=%s\n' "$multi_exit" "$multi_error" >&2
+              exit 1
+            fi
+
+            if [ "$multi_state" != '1;copy-mode;5;0' ]; then
+              printf 'tmux-dart smoke failed: multi-match cursor did not land on second target\n' >&2
+              exit 1
+            fi
+
+            case "$multi_content" in
+              *'\j'*|*'\f'*|*'\h'*)
+                printf 'tmux-dart smoke failed: visible backslash label artifact remains\n' >&2
                 exit 1
                 ;;
             esac
