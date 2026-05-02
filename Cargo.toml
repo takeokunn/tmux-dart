@@ -1,0 +1,22 @@
+[package]
+name = "tmux-dart"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+description = "EasyMotion-like cursor jump plugin for tmux"
+default-run = "tmux-dart"
+
+[dependencies]
+anyhow = "1.0"
+tempfile = "3.23"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "debuginfo"
