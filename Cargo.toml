@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 description = "EasyMotion-like cursor jump plugin for tmux"
+repository = "https://github.com/takeokunn/tmux-dart"
 default-run = "tmux-dart"
 
 [dependencies]

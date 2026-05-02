@@ -2,6 +2,8 @@
 
 Rust rewrite of `tmux-jump`: an EasyMotion-like cursor jump plugin for tmux.
 
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+
 ## Features
 
 - tmux plugin entrypoint via `tmux-dart.tmux`
@@ -13,22 +15,31 @@ Rust rewrite of `tmux-jump`: an EasyMotion-like cursor jump plugin for tmux.
 - jumps using tmux copy-mode commands
 - supports tmux options for key binding, colors, label placement, and matching behavior
 
-## Development
+## Prerequisites
 
-```bash
-nix develop
-tmux-dart-check
+[Nix](https://nixos.org/download) with [flakes enabled](https://nixos.wiki/wiki/Flakes#Enable_flakes) is required. The plugin automatically builds the binary on first load via `nix build`.
+
+## Install
+
+Clone the repository:
+
+```sh
+git clone https://github.com/takeokunn/tmux-dart ~/.tmux/plugins/tmux-dart
 ```
 
-`nix run .#check` runs the same Nix verification without entering the shell. Use
-`nix run .#smoke` for only the tmux smoke test, and `nix flake check` for
-sandboxed checks.
-
-## tmux setup
+Then add to your `tmux.conf`:
 
 ```tmux
-run-shell /path/to/tmux-dart/tmux-dart.tmux
+run-shell ~/.tmux/plugins/tmux-dart/tmux-dart.tmux
 ```
+
+### TPM
+
+```tmux
+set -g @plugin 'takeokunn/tmux-dart'
+```
+
+## Configuration
 
 Optional tmux settings:
 
@@ -48,3 +59,18 @@ characters), and `line` (first non-blank character on each matching line).
 `@jump-keys-position` accepts `left` and `off_left`. `@jump-label-keys` needs at
 least two unique non-whitespace characters; otherwise tmux-dart falls back to
 `jfhgkdlsa`.
+
+## Build
+
+```bash
+nix develop
+tmux-dart-check
+```
+
+`nix run .#check` runs the same Nix verification without entering the shell. Use
+`nix run .#smoke` for only the tmux smoke test, and `nix flake check` for
+sandboxed checks.
+
+## License
+
+MIT -- see [LICENSE](LICENSE) for details.
