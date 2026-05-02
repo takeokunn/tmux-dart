@@ -21,6 +21,54 @@ pub struct PaneState {
     pub pane_height: usize,
 }
 
+pub trait TmuxBackend {
+    fn current_pane_id(&self) -> Result<String>;
+    fn pane_state(&self, pane_id: &str) -> Result<PaneState>;
+    fn cancel_copy_mode(&self, pane: &PaneState) -> Result<()>;
+    fn capture_visible_pane(&self, pane: &PaneState) -> Result<String>;
+    fn capture_pane_with_escapes(&self, pane_id: &str) -> Result<String>;
+    fn write_to_tty(&self, pane: &PaneState, content: &str) -> Result<()>;
+    fn prompt_for_label_char(&self, prompt: &str) -> Result<Option<char>>;
+    fn jump_to_position(&self, pane: &PaneState, jump_to: usize) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RealTmux;
+
+impl TmuxBackend for RealTmux {
+    fn current_pane_id(&self) -> Result<String> {
+        current_pane_id()
+    }
+
+    fn pane_state(&self, pane_id: &str) -> Result<PaneState> {
+        pane_state(pane_id)
+    }
+
+    fn cancel_copy_mode(&self, pane: &PaneState) -> Result<()> {
+        cancel_copy_mode(pane)
+    }
+
+    fn capture_visible_pane(&self, pane: &PaneState) -> Result<String> {
+        capture_visible_pane(pane)
+    }
+
+    fn capture_pane_with_escapes(&self, pane_id: &str) -> Result<String> {
+        capture_pane_with_escapes(pane_id)
+    }
+
+    fn write_to_tty(&self, pane: &PaneState, content: &str) -> Result<()> {
+        write_to_tty(&pane.tty_path, content)
+    }
+
+    fn prompt_for_label_char(&self, prompt: &str) -> Result<Option<char>> {
+        prompt_for_label_char(prompt)
+    }
+
+    fn jump_to_position(&self, pane: &PaneState, jump_to: usize) -> Result<()> {
+        jump_to_position(pane, jump_to)
+    }
+}
+
 pub fn current_pane_id() -> Result<String> {
     tmux_output(["display-message", "-p", "#{pane_id}"])
 }
@@ -213,6 +261,20 @@ fn trim_single_trailing_newline(output: &[u8]) -> String {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'\''"#))
+}
+
+pub fn write_to_tty(path: &str, content: &str) -> Result<()> {
+    use std::{fs::OpenOptions, io::Write};
+
+    let mut tty = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open tty path {path}"))?;
+    tty.write_all(content.as_bytes())
+        .with_context(|| format!("failed to write overlay to tty {path}"))?;
+    tty.flush()
+        .with_context(|| format!("failed to flush tty {path}"))?;
+    Ok(())
 }
 
 fn tmux_success<const N: usize>(args: [&str; N]) -> Result<()> {

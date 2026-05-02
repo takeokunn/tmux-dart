@@ -1,10 +1,8 @@
-use std::{fs::OpenOptions, io::Write};
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::{
     jump::KeyPosition,
-    tmux::{PaneState, capture_pane_with_escapes},
+    tmux::{PaneState, TmuxBackend},
 };
 
 const CLEAR_SEQ: &str = "\u{1b}[2J";
@@ -14,7 +12,7 @@ const RESET_COLORS: &str = "\u{1b}[0m";
 const ENTER_ALTERNATE_HOME_SEQ: &str = concat!("\u{1b}[?1049h", "\u{1b}[H");
 const RESTORE_NORMAL_SCREEN: &str = "\u{1b}[?1049l";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayStyle {
     pub background: String,
     pub foreground: String,
@@ -25,33 +23,36 @@ pub fn decode_tmux_color(value: &str) -> String {
     value.replace(r#"\\e"#, "\u{1b}").replace(r#"\e"#, "\u{1b}")
 }
 
-pub fn with_recovered_screen<T, F>(pane: &PaneState, action: F) -> Result<T>
+pub fn with_recovered_screen<B, T, F>(backend: &B, pane: &PaneState, action: F) -> Result<T>
 where
+    B: TmuxBackend,
     F: FnOnce() -> Result<T>,
 {
     if pane.alternate_on {
-        with_alternate_screen_restore(pane, action)
+        with_alternate_screen_restore(backend, pane, action)
     } else {
-        with_normal_screen_restore(pane, action)
+        with_normal_screen_restore(backend, pane, action)
     }
 }
 
-fn with_normal_screen_restore<T, F>(pane: &PaneState, action: F) -> Result<T>
+fn with_normal_screen_restore<B, T, F>(backend: &B, pane: &PaneState, action: F) -> Result<T>
 where
+    B: TmuxBackend,
     F: FnOnce() -> Result<T>,
 {
-    append_to_tty(&pane.tty_path, ENTER_ALTERNATE_HOME_SEQ)?;
+    backend.write_to_tty(pane, ENTER_ALTERNATE_HOME_SEQ)?;
     let result = action();
-    append_to_tty(&pane.tty_path, RESTORE_NORMAL_SCREEN)?;
+    backend.write_to_tty(pane, RESTORE_NORMAL_SCREEN)?;
     result
 }
 
-fn with_alternate_screen_restore<T, F>(pane: &PaneState, action: F) -> Result<T>
+fn with_alternate_screen_restore<B, T, F>(backend: &B, pane: &PaneState, action: F) -> Result<T>
 where
+    B: TmuxBackend,
     F: FnOnce() -> Result<T>,
 {
-    let saved_screen = capture_pane_with_escapes(&pane.pane_id)?;
-    append_to_tty(&pane.tty_path, CLEAR_HOME_SEQ)?;
+    let saved_screen = backend.capture_pane_with_escapes(&pane.pane_id)?;
+    backend.write_to_tty(pane, CLEAR_HOME_SEQ)?;
     let result = action();
 
     let mut restore = String::from(RESET_COLORS);
@@ -63,21 +64,19 @@ where
         pane.cursor_x + 1
     ));
     restore.push_str(RESET_COLORS);
-    append_to_tty(&pane.tty_path, &restore)?;
+    backend.write_to_tty(pane, &restore)?;
     result
 }
 
-pub fn draw_overlay(
+pub fn draw_overlay<B: TmuxBackend + ?Sized>(
+    backend: &B,
     pane: &PaneState,
     screen: &str,
     positions: &[usize],
     labels: &[String],
     style: &OverlayStyle,
 ) -> Result<()> {
-    append_to_tty(
-        &pane.tty_path,
-        &render_overlay(screen, positions, labels, style),
-    )
+    backend.write_to_tty(pane, &render_overlay(screen, positions, labels, style))
 }
 
 fn render_overlay(
@@ -130,18 +129,6 @@ fn line_col_for_char_index(screen: &str, target_index: usize) -> (usize, usize) 
     }
 
     (line, column)
-}
-
-fn append_to_tty(path: &str, content: &str) -> Result<()> {
-    let mut tty = OpenOptions::new()
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open tty path {path}"))?;
-    tty.write_all(content.as_bytes())
-        .with_context(|| format!("failed to write overlay to tty {path}"))?;
-    tty.flush()
-        .with_context(|| format!("failed to flush tty {path}"))?;
-    Ok(())
 }
 
 #[cfg(test)]
