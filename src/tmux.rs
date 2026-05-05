@@ -29,6 +29,7 @@ pub trait TmuxBackend {
     fn capture_pane_with_escapes(&self, pane_id: &str) -> Result<String>;
     fn write_to_tty(&self, pane: &PaneState, content: &str) -> Result<()>;
     fn prompt_for_label_char(&self, prompt: &str) -> Result<Option<char>>;
+    fn display_message(&self, message: &str) -> Result<()>;
     fn jump_to_position(&self, pane: &PaneState, jump_to: usize) -> Result<()>;
 }
 
@@ -64,6 +65,10 @@ impl TmuxBackend for RealTmux {
         prompt_for_label_char(prompt)
     }
 
+    fn display_message(&self, message: &str) -> Result<()> {
+        display_message(message)
+    }
+
     fn jump_to_position(&self, pane: &PaneState, jump_to: usize) -> Result<()> {
         jump_to_position(pane, jump_to)
     }
@@ -71,6 +76,10 @@ impl TmuxBackend for RealTmux {
 
 pub fn current_pane_id() -> Result<String> {
     tmux_output(["display-message", "-p", "#{pane_id}"])
+}
+
+pub fn display_message(message: &str) -> Result<()> {
+    tmux_success(["display-message", message])
 }
 
 pub fn pane_state(pane_id: &str) -> Result<PaneState> {
@@ -154,13 +163,17 @@ fn wait_for_char_file(
     previous_activity: Option<&str>,
     timeout: Duration,
 ) -> Result<Option<char>> {
-    let deadline = Instant::now() + timeout;
+    let started_at = Instant::now();
+    let deadline = started_at + timeout;
+    let activity_change_grace_period = Duration::from_millis(250);
+
     loop {
         if let Some(ch) = read_first_char_from_file(path)? {
             return Ok(Some(ch));
         }
 
-        if let Some(previous_activity) = previous_activity
+        if started_at.elapsed() >= activity_change_grace_period
+            && let Some(previous_activity) = previous_activity
             && session_activity()? != previous_activity
         {
             return Ok(None);

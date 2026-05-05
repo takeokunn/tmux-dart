@@ -74,6 +74,10 @@ pub fn run_jump_report<B: TmuxBackend>(backend: &B, request: JumpRequest) -> Res
         request.config.options.case_sensitive,
     );
     if positions.is_empty() {
+        backend.display_message(&format!(
+            "tmux-dart: no matches for '{}'",
+            request.initial_char
+        ))?;
         return Ok(machine.finish(JumpState::Cancelled));
     }
     if request.config.options.auto_jump && positions.len() == 1 {
@@ -87,6 +91,7 @@ pub fn run_jump_report<B: TmuxBackend>(backend: &B, request: JumpRequest) -> Res
         select_position_index(backend, &pane, &screen, &positions, &request.config)
     })?;
     let Some(selected_index) = selected_index else {
+        backend.display_message("tmux-dart: jump cancelled")?;
         return Ok(machine.finish(JumpState::Cancelled));
     };
 
@@ -168,18 +173,30 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         screen: String,
-        prompts: RefCell<VecDeque<char>>,
+        prompts: RefCell<VecDeque<Option<char>>>,
         writes: RefCell<Vec<String>>,
         jumped_to: RefCell<Option<usize>>,
+        messages: RefCell<Vec<String>>,
     }
 
     impl FakeBackend {
         fn with_prompts(prompts: impl IntoIterator<Item = char>) -> Self {
             Self {
                 screen: String::from("qone qtwo qthree qfour"),
+                prompts: RefCell::new(prompts.into_iter().map(Some).collect()),
+                writes: RefCell::default(),
+                jumped_to: RefCell::default(),
+                messages: RefCell::default(),
+            }
+        }
+
+        fn with_prompt_results(prompts: impl IntoIterator<Item = Option<char>>) -> Self {
+            Self {
+                screen: String::from("qone qtwo qthree qfour"),
                 prompts: RefCell::new(prompts.into_iter().collect()),
                 writes: RefCell::default(),
                 jumped_to: RefCell::default(),
+                messages: RefCell::default(),
             }
         }
 
@@ -225,7 +242,12 @@ mod tests {
         }
 
         fn prompt_for_label_char(&self, _prompt: &str) -> Result<Option<char>> {
-            Ok(self.prompts.borrow_mut().pop_front())
+            Ok(self.prompts.borrow_mut().pop_front().flatten())
+        }
+
+        fn display_message(&self, message: &str) -> Result<()> {
+            self.messages.borrow_mut().push(message.to_owned());
+            Ok(())
         }
 
         fn jump_to_position(&self, _pane: &PaneState, jump_to: usize) -> Result<()> {
@@ -267,11 +289,12 @@ mod tests {
                 .iter()
                 .any(|write| write.contains('f'))
         );
+        assert!(backend.messages.borrow().is_empty());
         Ok(())
     }
 
     #[test]
-    fn jump_flow_auto_jumps_single_target_without_overlay() -> Result<()> {
+    fn jump_flow_auto_jumps_single_target_without_overlay_or_message() -> Result<()> {
         let backend = FakeBackend::default().with_screen("only");
         let report = run_jump_report(
             &backend,
@@ -294,6 +317,7 @@ mod tests {
         );
         assert_eq!(*backend.jumped_to.borrow(), Some(0));
         assert!(backend.writes.borrow().is_empty());
+        assert!(backend.messages.borrow().is_empty());
         Ok(())
     }
 
@@ -321,11 +345,46 @@ mod tests {
         );
         assert_eq!(*backend.jumped_to.borrow(), None);
         assert_eq!(backend.writes.borrow().len(), 3);
+        assert_eq!(
+            backend.messages.borrow().as_slice(),
+            ["tmux-dart: jump cancelled"]
+        );
         Ok(())
     }
 
     #[test]
-    fn jump_flow_cancels_without_screen_recovery_when_no_targets_exist() -> Result<()> {
+    fn jump_flow_emits_cancellation_message_when_label_prompt_is_dismissed() -> Result<()> {
+        let backend = FakeBackend::with_prompt_results([None]);
+        let report = run_jump_report(
+            &backend,
+            JumpRequest {
+                initial_char: 'q',
+                pane_id: None,
+                config: JumpConfig::from_values(EnvValues::default()),
+            },
+        )?;
+
+        assert_eq!(report.state, JumpState::Cancelled);
+        assert_eq!(
+            report.transitions,
+            vec![
+                JumpState::ResolvePane,
+                JumpState::CaptureScreen,
+                JumpState::SelectTarget,
+                JumpState::Cancelled,
+            ]
+        );
+        assert_eq!(*backend.jumped_to.borrow(), None);
+        assert_eq!(backend.writes.borrow().len(), 3);
+        assert_eq!(
+            backend.messages.borrow().as_slice(),
+            ["tmux-dart: jump cancelled"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn jump_flow_emits_no_match_message_when_no_targets_exist() -> Result<()> {
         let backend = FakeBackend::default().with_screen("only");
         let report = run_jump_report(
             &backend,
@@ -347,6 +406,10 @@ mod tests {
         );
         assert!(backend.writes.borrow().is_empty());
         assert_eq!(*backend.jumped_to.borrow(), None);
+        assert_eq!(
+            backend.messages.borrow().as_slice(),
+            ["tmux-dart: no matches for 'z'"]
+        );
         Ok(())
     }
 }
