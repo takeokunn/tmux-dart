@@ -62,14 +62,6 @@ run_tmux_dart_jump() {
   "$bin" jump "$@"
 }
 
-prompt_initial_char() {
-  local jump_char_file="$1"
-  local quoted_jump_char_file
-
-  printf -v quoted_jump_char_file '%q' "$jump_char_file"
-  tmux command-prompt -1 -p 'char:' "run-shell \"printf '%1' > $quoted_jump_char_file\""
-}
-
 run_jump_with_char() {
   if [ "$#" -ne 1 ]; then
     tmux display-message "tmux-dart: missing jump character"
@@ -82,31 +74,17 @@ run_jump_with_char() {
   run_tmux_dart_jump --char "$1"
 }
 
-run_jump_with_char_file() {
-  if [ "$#" -ne 1 ]; then
-    tmux display-message "tmux-dart: missing jump character file"
-    exit 1
-  fi
+install_key_binding() {
+  local jump_key
+  local quoted_script
 
-  run_tmux_dart_jump --char-file "$1"
-}
-
-prompt_and_run_jump() {
-  local jump_char_file
-  local quoted_jump_char_file
-
-  jump_char_file="$(mktemp)"
-  printf -v quoted_jump_char_file '%q' "$jump_char_file"
-  trap "rm -f $quoted_jump_char_file" EXIT HUP INT TERM
-
-  prompt_initial_char "$jump_char_file"
-  run_jump_with_char_file "$jump_char_file"
+  jump_key="$(get_tmux_option "@jump-key" "j")"
+  printf -v quoted_script '%q' "$CURRENT_DIR/tmux-dart.tmux"
+  tmux bind-key -N "Jump to pane location in copy mode" "$jump_key" \
+    command-prompt -1 -p 'char:' "run-shell -b \"$quoted_script --char '%1'\""
 }
 
 case "${1:-}" in
-  --prompt)
-    prompt_and_run_jump
-    ;;
   --char)
     run_jump_with_char "${2:-}"
     ;;
@@ -114,7 +92,7 @@ case "${1:-}" in
     if [ -z "${TMUX_DART_BINARY:-}" ]; then
       build_binary
     fi
-    tmux bind-key -N "Jump to pane location in copy mode" "$(get_tmux_option "@jump-key" "j")" run-shell -b "$CURRENT_DIR/tmux-dart.tmux --prompt"
+    install_key_binding
     ;;
   *)
     tmux display-message "tmux-dart: unexpected arguments"
