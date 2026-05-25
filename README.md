@@ -2,6 +2,7 @@
 
 `tmux-dart` is an EasyMotion-like cursor jump plugin for tmux. It is implemented in Rust.
 
+[![CI](https://github.com/takeokunn/tmux-dart/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/takeokunn/tmux-dart/actions/workflows/main.yml)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
 ![screenshot](./screenshot.png)
