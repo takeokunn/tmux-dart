@@ -1,4 +1,5 @@
 use anyhow::Result;
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     jump::KeyPosition,
@@ -124,7 +125,7 @@ fn line_col_for_char_index(screen: &str, target_index: usize) -> (usize, usize) 
             line += 1;
             column = 0;
         } else {
-            column += 1;
+            column += UnicodeWidthChar::width(ch).unwrap_or(0);
         }
     }
 
@@ -178,6 +179,20 @@ mod tests {
 
         assert!(left.contains("\u{1b}[1;3HFGjk"));
         assert!(off_left.contains("\u{1b}[1;1HFGjk"));
+    }
+
+    #[test]
+    fn render_overlay_places_label_at_display_column_after_wide_characters() {
+        let positions = [4usize];
+        let labels = [String::from("j")];
+        let rendered = render_overlay(
+            "あいう x",
+            &positions[..],
+            &labels[..],
+            &style(KeyPosition::Left),
+        );
+
+        assert!(rendered.contains("\u{1b}[1;8HFGj"));
     }
 
     #[test]
