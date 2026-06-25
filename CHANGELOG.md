@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- In default `word` mode, non-word targets (punctuation, symbols, whitespace such as `/`) now match every occurrence instead of reporting no match.
+
 ## [0.1.0] - 2026-05-18
 
 ### Added

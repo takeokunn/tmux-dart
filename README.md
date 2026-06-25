@@ -73,7 +73,7 @@ set -g @jump-auto-jump 'on'
 
 | Value | Behavior |
 | --- | --- |
-| `word` | Matches word starts. Unknown values are treated as `word`. |
+| `word` | Matches word starts. Non-word targets (punctuation, symbols, whitespace) match every occurrence. Unknown values are treated as `word`. |
 | `char` / `anywhere` | Matches every occurrence of the requested character. |
 | `line` / `line_start` | Matches the first non-blank character on each matching line. |
 
