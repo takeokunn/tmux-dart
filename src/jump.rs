@@ -63,6 +63,13 @@ fn chars_match(lhs: char, rhs: char, case_sensitive: bool) -> bool {
 }
 
 fn word_positions(target: char, chars: &[char], case_sensitive: bool) -> Vec<usize> {
+    // Word-start matching is only meaningful for word characters. A non-word
+    // target (punctuation, symbols, whitespace) can never be at a word start,
+    // so fall back to matching every occurrence instead of returning nothing.
+    if !is_word_char(target) {
+        return char_positions(target, chars, case_sensitive);
+    }
+
     let mut positions = Vec::new();
 
     if let Some(first) = chars.first()
@@ -200,6 +207,51 @@ mod tests {
         assert_eq!(positions_of('h', screen), vec![9, 46]);
         assert_eq!(positions_of('e', screen), vec![3, 22, 59]);
         assert!(positions_of('s', screen).is_empty());
+    }
+
+    #[test]
+    fn word_mode_falls_back_to_char_matching_for_non_word_targets() {
+        let screen = "~$ cat src/jump.rs and src/main.rs\n/usr/local/bin";
+        // A punctuation target ('/') is never a word start, so word mode must
+        // surface every occurrence, identical to char mode.
+        assert_eq!(
+            positions_for('/', screen, MatchMode::Word, false),
+            positions_for('/', screen, MatchMode::Char, false),
+        );
+        assert!(!positions_for('/', screen, MatchMode::Word, false).is_empty());
+        // Pin concrete indices so the test fails if char-matching itself drifts,
+        // not only when the two modes diverge.
+        assert_eq!(
+            positions_for('/', "a/b/c", MatchMode::Word, false),
+            vec![1, 3]
+        );
+
+        // Other non-word targets behave the same way.
+        for target in ['.', '-', '$'] {
+            assert_eq!(
+                positions_for(target, screen, MatchMode::Word, false),
+                positions_for(target, screen, MatchMode::Char, false),
+                "word-mode fallback diverged from char mode for {target:?}",
+            );
+        }
+
+        // Whitespace is non-word too and is included in the fallback.
+        assert_eq!(
+            positions_for(' ', screen, MatchMode::Word, false),
+            positions_for(' ', screen, MatchMode::Char, false),
+        );
+    }
+
+    #[test]
+    fn word_mode_keeps_word_start_matching_for_word_targets() {
+        // Regression guard: word-character targets must be unaffected by the
+        // non-word fallback and keep pure word-start semantics.
+        let screen = "alpha apple\n  beta banana";
+        assert_eq!(
+            positions_for('a', screen, MatchMode::Word, false),
+            vec![0, 6]
+        );
+        assert_eq!(positions_of('s', "qone qtwo qthree"), Vec::<usize>::new());
     }
 
     #[test]

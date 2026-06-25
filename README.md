@@ -2,6 +2,7 @@
 
 `tmux-dart` is an EasyMotion-like cursor jump plugin for tmux. It is implemented in Rust.
 
+[![CI](https://github.com/takeokunn/tmux-dart/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/takeokunn/tmux-dart/actions/workflows/main.yml)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
 ![screenshot](./screenshot.png)
@@ -72,7 +73,7 @@ set -g @jump-auto-jump 'on'
 
 | Value | Behavior |
 | --- | --- |
-| `word` | Matches word starts. Unknown values are treated as `word`. |
+| `word` | Matches word starts. Non-word targets (punctuation, symbols, whitespace) match every occurrence. Unknown values are treated as `word`. |
 | `char` / `anywhere` | Matches every occurrence of the requested character. |
 | `line` / `line_start` | Matches the first non-blank character on each matching line. |
 

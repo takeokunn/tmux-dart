@@ -322,6 +322,68 @@ mod tests {
     }
 
     #[test]
+    fn jump_flow_auto_jumps_to_non_word_target_in_default_word_mode() -> Result<()> {
+        // Regression guard for the reported bug: a non-word target such as '/'
+        // must be jumpable in the default word mode, not reported as "no match".
+        let backend = FakeBackend::default().with_screen("a/b");
+        let report = run_jump_report(
+            &backend,
+            JumpRequest {
+                initial_char: '/',
+                pane_id: None,
+                config: JumpConfig::from_values(EnvValues::default()),
+            },
+        )?;
+
+        assert_eq!(report.state, JumpState::Done);
+        assert_eq!(
+            report.transitions,
+            vec![
+                JumpState::ResolvePane,
+                JumpState::CaptureScreen,
+                JumpState::JumpToTarget,
+                JumpState::Done,
+            ]
+        );
+        assert_eq!(*backend.jumped_to.borrow(), Some(1));
+        assert!(backend.writes.borrow().is_empty());
+        assert!(backend.messages.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn jump_flow_selects_non_word_target_through_overlay() -> Result<()> {
+        // Many-match non-word target must drive the overlay/label path, not just
+        // the single-match auto-jump path.
+        let backend = FakeBackend::with_prompts(['f']).with_screen("a/b/c");
+        let report = run_jump_report(
+            &backend,
+            JumpRequest {
+                initial_char: '/',
+                pane_id: None,
+                config: JumpConfig::from_values(EnvValues::default()),
+            },
+        )?;
+
+        assert_eq!(report.state, JumpState::Done);
+        assert_eq!(
+            report.transitions,
+            vec![
+                JumpState::ResolvePane,
+                JumpState::CaptureScreen,
+                JumpState::SelectTarget,
+                JumpState::JumpToTarget,
+                JumpState::Done,
+            ]
+        );
+        // Slashes sit at indices 1 and 3; label 'f' is the second label key.
+        assert_eq!(*backend.jumped_to.borrow(), Some(3));
+        assert!(!backend.writes.borrow().is_empty());
+        assert!(backend.messages.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn jump_flow_cancels_when_label_prompt_is_invalid() -> Result<()> {
         let backend = FakeBackend::with_prompts(['x']);
         let report = run_jump_report(
