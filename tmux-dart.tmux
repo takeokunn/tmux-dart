@@ -47,6 +47,7 @@ ensure_binary() {
 export_jump_env() {
   export JUMP_BACKGROUND_COLOR="$(get_tmux_option '@jump-bg-color' '\e[0m\e[32m')"
   export JUMP_FOREGROUND_COLOR="$(get_tmux_option '@jump-fg-color' '\e[1m\e[31m')"
+  export JUMP_THEME="$(get_tmux_option '@jump-theme' 'classic')"
   export JUMP_KEYS_POSITION="$(get_tmux_option '@jump-keys-position' 'left')"
   export JUMP_LABEL_KEYS="$(get_tmux_option '@jump-label-keys' 'jfhgkdlsa')"
   export JUMP_MATCH_MODE="$(get_tmux_option '@jump-match-mode' 'word')"
@@ -81,7 +82,7 @@ install_key_binding() {
   jump_key="$(get_tmux_option "@jump-key" "j")"
   printf -v quoted_script '%q' "$CURRENT_DIR/tmux-dart.tmux"
   tmux bind-key -N "Jump to pane location in copy mode" "$jump_key" \
-    command-prompt -1 -p 'char:' "run-shell -b \"$quoted_script --char '%1'\""
+    command-prompt -1 -p 'jump char:' "run-shell -b \"$quoted_script --char '%%%'\""
 }
 
 case "${1:-}" in

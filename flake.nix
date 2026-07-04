@@ -60,6 +60,18 @@
               cargo fmt --check
               touch $out
             '';
+        clippy =
+          (packageFor pkgs).overrideAttrs (_old: {
+            pname = "tmux-dart-clippy";
+            nativeBuildInputs = (_old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
+            doCheck = false;
+            buildPhase = ''
+              cargo clippy --all-targets -- -D warnings
+            '';
+            installPhase = ''
+              touch $out
+            '';
+          });
         package = packageFor pkgs;
       });
 
@@ -82,7 +94,7 @@
             === tmux-dart Development Shell ===
 
             Quick verification:
-              nix flake check  # sandboxed shell syntax + fmt + package build/tests
+              nix flake check  # bash syntax + fmt + clippy + package build/tests
 
             Plugin testing:
               # No pre-build needed; tmux-dart.tmux runs nix build on plugin load.

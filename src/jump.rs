@@ -1,3 +1,5 @@
+use unicode_width::UnicodeWidthChar;
+
 pub const DEFAULT_LABEL_KEYS: [char; 9] = ['j', 'f', 'h', 'g', 'k', 'd', 'l', 's', 'a'];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,20 +22,78 @@ impl MatchMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyPosition {
     Left,
+    Right,
     OffLeft,
 }
 
 impl KeyPosition {
     pub fn from_env(value: &str) -> Self {
         match value {
+            "right" => Self::Right,
             "off_left" => Self::OffLeft,
             _ => Self::Left,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayPosition {
+    pub row: usize,
+    pub column: usize,
+}
+
 fn is_word_char(ch: char) -> bool {
     ch == '_' || ch.is_alphanumeric()
+}
+
+/// Row/column for drawing an overlay label. `column` is a **display** column:
+/// each character contributes its terminal width, so a wide (East Asian)
+/// character counts as two. This matches ANSI absolute cursor positioning
+/// (`ESC[row;colH`) used by the overlay.
+pub fn display_position_for_char_index(screen: &str, target_index: usize) -> DisplayPosition {
+    position_for_char_index(screen, target_index, ColumnMetric::DisplayWidth)
+}
+
+/// Row/column for driving copy-mode `cursor-right`. `column` is a **character**
+/// count from the start of the row. tmux's `cursor-right` skips the padding
+/// cell of a wide character, so one press moves exactly one logical character
+/// regardless of display width; counting display cells would overshoot on any
+/// line containing wide characters.
+pub fn jump_position_for_char_index(screen: &str, target_index: usize) -> DisplayPosition {
+    position_for_char_index(screen, target_index, ColumnMetric::CharCount)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnMetric {
+    DisplayWidth,
+    CharCount,
+}
+
+fn position_for_char_index(
+    screen: &str,
+    target_index: usize,
+    metric: ColumnMetric,
+) -> DisplayPosition {
+    let mut row = 0usize;
+    let mut column = 0usize;
+
+    for (index, ch) in screen.chars().enumerate() {
+        if index == target_index {
+            return DisplayPosition { row, column };
+        }
+
+        if ch == '\n' {
+            row += 1;
+            column = 0;
+        } else {
+            column += match metric {
+                ColumnMetric::DisplayWidth => UnicodeWidthChar::width(ch).unwrap_or(0),
+                ColumnMetric::CharCount => 1,
+            };
+        }
+    }
+
+    DisplayPosition { row, column }
 }
 
 pub fn positions_of(target: char, screen: &str) -> Vec<usize> {
@@ -144,7 +204,7 @@ pub fn label_keys_from_env(value: &str) -> Vec<char> {
 }
 
 pub fn labels_for(position_count: usize, label_keys: &[char]) -> Vec<String> {
-    let label_keys = if label_keys.is_empty() {
+    let label_keys = if label_keys.len() < 2 {
         DEFAULT_LABEL_KEYS.as_slice()
     } else {
         label_keys
@@ -166,7 +226,7 @@ pub fn labels_for(position_count: usize, label_keys: &[char]) -> Vec<String> {
 pub fn label_length_for(position_count: usize, label_keys: &[char]) -> usize {
     labels_for(position_count, label_keys)
         .first()
-        .map(std::string::String::len)
+        .map(|s| s.chars().count())
         .unwrap_or(1)
 }
 
@@ -199,6 +259,9 @@ mod tests {
     use super::{
         DEFAULT_LABEL_KEYS, MatchMode, bounded_subset_bounds, label_keys_from_env,
         label_length_for, labels_for, positions_for, positions_of, subset_bounds,
+    };
+    use crate::jump::{
+        DisplayPosition, KeyPosition, display_position_for_char_index, jump_position_for_char_index,
     };
 
     #[test]
@@ -252,6 +315,39 @@ mod tests {
             vec![0, 6]
         );
         assert_eq!(positions_of('s', "qone qtwo qthree"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn display_position_uses_display_width_and_newlines() {
+        assert_eq!(
+            display_position_for_char_index("あいう x\nab", 4),
+            DisplayPosition { row: 0, column: 7 }
+        );
+        assert_eq!(
+            display_position_for_char_index("あいう x\nab", 6),
+            DisplayPosition { row: 1, column: 0 }
+        );
+    }
+
+    #[test]
+    fn jump_position_counts_characters_not_display_width() {
+        // Copy-mode `cursor-right` skips a wide character's padding cell, so the
+        // jump must count one column per logical character. The overlay, by
+        // contrast, needs display cells. Both must agree on the row.
+        let screen = "あいう z\nab";
+        assert_eq!(
+            jump_position_for_char_index(screen, 4),
+            DisplayPosition { row: 0, column: 4 }
+        );
+        assert_eq!(
+            display_position_for_char_index(screen, 4),
+            DisplayPosition { row: 0, column: 7 }
+        );
+        // Row counting stays identical across both metrics.
+        assert_eq!(
+            jump_position_for_char_index(screen, 6),
+            DisplayPosition { row: 1, column: 0 }
+        );
     }
 
     #[test]
@@ -324,5 +420,13 @@ mod tests {
             vec![4, 9, 13, 19, 20, 24, 31, 33, 37]
         );
         assert_eq!(positions_for('b', screen, MatchMode::Line, false), vec![28]);
+    }
+
+    #[test]
+    fn key_position_from_env_accepts_left_right_and_off_left() {
+        assert_eq!(KeyPosition::from_env("left"), KeyPosition::Left);
+        assert_eq!(KeyPosition::from_env("right"), KeyPosition::Right);
+        assert_eq!(KeyPosition::from_env("off_left"), KeyPosition::OffLeft);
+        assert_eq!(KeyPosition::from_env("unknown"), KeyPosition::Left);
     }
 }

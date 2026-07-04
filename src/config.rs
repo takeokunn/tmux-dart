@@ -2,7 +2,7 @@ use std::env;
 
 use crate::{
     jump::{DEFAULT_LABEL_KEYS, KeyPosition, MatchMode, label_keys_from_env},
-    overlay::{OverlayStyle, decode_tmux_color},
+    overlay::{OverlayStyle, OverlayTheme, decode_tmux_color},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +26,7 @@ impl JumpConfig {
             match_mode: env::var("JUMP_MATCH_MODE").ok(),
             case_sensitive: env::var("JUMP_CASE_SENSITIVE").ok(),
             auto_jump: env::var("JUMP_AUTO_JUMP").ok(),
+            theme: env::var("JUMP_THEME").ok(),
             background_color: env::var("JUMP_BACKGROUND_COLOR").ok(),
             foreground_color: env::var("JUMP_FOREGROUND_COLOR").ok(),
             key_position: env::var("JUMP_KEYS_POSITION").ok(),
@@ -43,21 +44,16 @@ impl JumpConfig {
             case_sensitive: option_enabled(values.case_sensitive.as_deref().unwrap_or_default()),
             auto_jump: !option_disabled(values.auto_jump.as_deref().unwrap_or_default()),
         };
-        let overlay_style = OverlayStyle {
-            background: decode_tmux_color(
-                values
-                    .background_color
-                    .as_deref()
-                    .unwrap_or(r#"\e[0m\e[32m"#),
-            ),
-            foreground: decode_tmux_color(
-                values
-                    .foreground_color
-                    .as_deref()
-                    .unwrap_or(r#"\e[1m\e[31m"#),
-            ),
-            key_position: KeyPosition::from_env(values.key_position.as_deref().unwrap_or("left")),
-        };
+        let mut overlay_style =
+            OverlayTheme::from_env(values.theme.as_deref().unwrap_or("classic")).defaults();
+        if let Some(background_color) = values.background_color.as_deref() {
+            overlay_style.background = decode_tmux_color(background_color);
+        }
+        if let Some(foreground_color) = values.foreground_color.as_deref() {
+            overlay_style.foreground = decode_tmux_color(foreground_color);
+        }
+        overlay_style.key_position =
+            KeyPosition::from_env(values.key_position.as_deref().unwrap_or("left"));
 
         Self {
             options,
@@ -72,6 +68,7 @@ pub struct EnvValues {
     pub match_mode: Option<String>,
     pub case_sensitive: Option<String>,
     pub auto_jump: Option<String>,
+    pub theme: Option<String>,
     pub background_color: Option<String>,
     pub foreground_color: Option<String>,
     pub key_position: Option<String>,
@@ -100,6 +97,7 @@ mod tests {
         assert_eq!(config.overlay_style.key_position, KeyPosition::Left);
         assert_eq!(config.overlay_style.background, "\u{1b}[0m\u{1b}[32m");
         assert_eq!(config.overlay_style.foreground, "\u{1b}[1m\u{1b}[31m");
+        assert_eq!(config.overlay_style.label_style, "\u{1b}[1m");
     }
 
     #[test]
@@ -109,17 +107,19 @@ mod tests {
             match_mode: Some(String::from("char")),
             case_sensitive: Some(String::from("on")),
             auto_jump: Some(String::from("off")),
+            theme: Some(String::from("contrast")),
             background_color: Some(String::from(r#"\e[34m"#)),
             foreground_color: Some(String::from(r#"\e[35m"#)),
-            key_position: Some(String::from("off_left")),
+            key_position: Some(String::from("right")),
         });
 
         assert_eq!(config.options.label_keys, vec!['a', 'b', 'c']);
         assert_eq!(config.options.match_mode, MatchMode::Char);
         assert!(config.options.case_sensitive);
         assert!(!config.options.auto_jump);
-        assert_eq!(config.overlay_style.key_position, KeyPosition::OffLeft);
+        assert_eq!(config.overlay_style.key_position, KeyPosition::Right);
         assert_eq!(config.overlay_style.background, "\u{1b}[34m");
         assert_eq!(config.overlay_style.foreground, "\u{1b}[35m");
+        assert_eq!(config.overlay_style.label_style, "\u{1b}[1m\u{1b}[7m");
     }
 }

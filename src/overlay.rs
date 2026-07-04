@@ -2,7 +2,7 @@ use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    jump::KeyPosition,
+    jump::{KeyPosition, display_position_for_char_index},
     tmux::{PaneState, TmuxBackend},
 };
 
@@ -13,15 +13,89 @@ const RESET_COLORS: &str = "\u{1b}[0m";
 const ENTER_ALTERNATE_HOME_SEQ: &str = concat!("\u{1b}[?1049h", "\u{1b}[H");
 const RESTORE_NORMAL_SCREEN: &str = "\u{1b}[?1049l";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayTheme {
+    Classic,
+    Contrast,
+    Soft,
+}
+
+impl OverlayTheme {
+    pub fn from_env(value: &str) -> Self {
+        match value {
+            "contrast" | "high_contrast" | "high-contrast" => Self::Contrast,
+            "soft" | "muted" => Self::Soft,
+            _ => Self::Classic,
+        }
+    }
+
+    pub fn defaults(self) -> OverlayStyle {
+        match self {
+            Self::Classic => OverlayStyle {
+                background: String::from("\u{1b}[0m\u{1b}[32m"),
+                foreground: String::from("\u{1b}[1m\u{1b}[31m"),
+                label_style: String::from("\u{1b}[1m"),
+                key_position: KeyPosition::Left,
+            },
+            Self::Contrast => OverlayStyle {
+                background: String::from("\u{1b}[0m\u{1b}[37m"),
+                foreground: String::from("\u{1b}[1m\u{1b}[30m"),
+                label_style: String::from("\u{1b}[1m\u{1b}[7m"),
+                key_position: KeyPosition::Left,
+            },
+            Self::Soft => OverlayStyle {
+                background: String::from("\u{1b}[0m\u{1b}[2m\u{1b}[36m"),
+                foreground: String::from("\u{1b}[1m\u{1b}[33m"),
+                label_style: String::from("\u{1b}[1m"),
+                key_position: KeyPosition::Left,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayStyle {
     pub background: String,
     pub foreground: String,
+    pub label_style: String,
     pub key_position: KeyPosition,
 }
 
 pub fn decode_tmux_color(value: &str) -> String {
-    value.replace(r#"\\e"#, "\u{1b}").replace(r#"\e"#, "\u{1b}")
+    let decoded = value.replace(r#"\\e"#, "\u{1b}").replace(r#"\e"#, "\u{1b}");
+    retain_sgr_sequences(&decoded)
+}
+
+fn retain_sgr_sequences(value: &str) -> String {
+    let mut retained = String::new();
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' || chars.next_if_eq(&'[').is_none() {
+            continue;
+        }
+
+        let mut params = String::new();
+        while let Some(&param) = chars.peek() {
+            if param == 'm' {
+                chars.next();
+                retained.push('\u{1b}');
+                retained.push('[');
+                retained.push_str(&params);
+                retained.push('m');
+                break;
+            }
+
+            if param.is_ascii_digit() || param == ';' || param == ':' {
+                params.push(param);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+    }
+
+    retained
 }
 
 pub fn with_recovered_screen<B, T, F>(backend: &B, pane: &PaneState, action: F) -> Result<T>
@@ -42,9 +116,9 @@ where
     F: FnOnce() -> Result<T>,
 {
     backend.write_to_tty(pane, ENTER_ALTERNATE_HOME_SEQ)?;
-    let result = action();
-    backend.write_to_tty(pane, RESTORE_NORMAL_SCREEN)?;
-    result
+    let action_result = action();
+    let restore_result = backend.write_to_tty(pane, RESTORE_NORMAL_SCREEN);
+    action_result.and_then(|v| restore_result.map(|()| v))
 }
 
 fn with_alternate_screen_restore<B, T, F>(backend: &B, pane: &PaneState, action: F) -> Result<T>
@@ -54,7 +128,7 @@ where
 {
     let saved_screen = backend.capture_pane_with_escapes(&pane.pane_id)?;
     backend.write_to_tty(pane, CLEAR_HOME_SEQ)?;
-    let result = action();
+    let action_result = action();
 
     let mut restore = String::from(RESET_COLORS);
     restore.push_str(CLEAR_SEQ);
@@ -65,8 +139,8 @@ where
         pane.cursor_x + 1
     ));
     restore.push_str(RESET_COLORS);
-    backend.write_to_tty(pane, &restore)?;
-    result
+    let restore_result = backend.write_to_tty(pane, &restore);
+    action_result.and_then(|v| restore_result.map(|()| v))
 }
 
 pub fn draw_overlay<B: TmuxBackend + ?Sized>(
@@ -92,44 +166,37 @@ fn render_overlay(
     rendered.push_str(&screen.replace('\n', "\n\r"));
 
     for (position, label) in positions.iter().zip(labels.iter()) {
-        let (line, column) = line_col_for_char_index(screen, *position);
-        let label_width = label.chars().count();
+        let display_position = display_position_for_char_index(screen, *position);
+        let label_width: usize = label
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
+            .sum();
         let start_column = match style.key_position {
-            KeyPosition::Left => column,
-            KeyPosition::OffLeft => column.saturating_sub(label_width),
+            KeyPosition::Left => display_position.column,
+            KeyPosition::Right => {
+                let target_width = screen
+                    .chars()
+                    .nth(*position)
+                    .and_then(UnicodeWidthChar::width)
+                    .unwrap_or(1);
+                display_position.column + target_width
+            }
+            KeyPosition::OffLeft => display_position.column.saturating_sub(label_width),
         };
 
         rendered.push_str(&format!(
-            "\u{1b}[{};{}H{}{}",
-            line + 1,
+            "\u{1b}[{};{}H{}{}{}{}",
+            display_position.row + 1,
             start_column + 1,
             style.foreground,
+            style.label_style,
             label,
+            RESET_COLORS,
         ));
     }
 
     rendered.push_str(HOME_SEQ);
     rendered
-}
-
-fn line_col_for_char_index(screen: &str, target_index: usize) -> (usize, usize) {
-    let mut line = 0usize;
-    let mut column = 0usize;
-
-    for (index, ch) in screen.chars().enumerate() {
-        if index == target_index {
-            return (line, column);
-        }
-
-        if ch == '\n' {
-            line += 1;
-            column = 0;
-        } else {
-            column += UnicodeWidthChar::width(ch).unwrap_or(0);
-        }
-    }
-
-    (line, column)
 }
 
 #[cfg(test)]
@@ -141,6 +208,7 @@ mod tests {
         OverlayStyle {
             background: String::from("BG"),
             foreground: String::from("FG"),
+            label_style: String::from("LB"),
             key_position,
         }
     }
@@ -176,9 +244,16 @@ mod tests {
             &labels[..],
             &style(KeyPosition::OffLeft),
         );
+        let right = render_overlay(
+            "alpha",
+            &positions[..],
+            &labels[..],
+            &style(KeyPosition::Right),
+        );
 
-        assert!(left.contains("\u{1b}[1;3HFGjk"));
-        assert!(off_left.contains("\u{1b}[1;1HFGjk"));
+        assert!(left.contains("\u{1b}[1;3HFGLBjk\u{1b}[0m"));
+        assert!(off_left.contains("\u{1b}[1;1HFGLBjk\u{1b}[0m"));
+        assert!(right.contains("\u{1b}[1;4HFGLBjk\u{1b}[0m"));
     }
 
     #[test]
@@ -192,12 +267,42 @@ mod tests {
             &style(KeyPosition::Left),
         );
 
-        assert!(rendered.contains("\u{1b}[1;8HFGj"));
+        assert!(rendered.contains("\u{1b}[1;8HFGLBj\u{1b}[0m"));
+    }
+
+    #[test]
+    fn render_overlay_places_label_to_the_right_of_wide_characters() {
+        let positions = [4usize];
+        let labels = [String::from("j")];
+        let rendered = render_overlay(
+            "あいう x",
+            &positions[..],
+            &labels[..],
+            &style(KeyPosition::Right),
+        );
+
+        assert!(rendered.contains("\u{1b}[1;9HFGLBj\u{1b}[0m"));
     }
 
     #[test]
     fn decode_tmux_color_supports_single_and_double_escaped_values() {
         assert_eq!(decode_tmux_color(r#"\e[32m"#), "\u{1b}[32m");
         assert_eq!(decode_tmux_color(r#"\\e[32m"#), "\u{1b}[32m");
+    }
+
+    #[test]
+    fn decode_tmux_color_supports_extended_sgr_values() {
+        assert_eq!(
+            decode_tmux_color(r#"\e[38;2;1;2;3m\e[48:2:4:5:6m"#),
+            "\u{1b}[38;2;1;2;3m\u{1b}[48:2:4:5:6m"
+        );
+    }
+
+    #[test]
+    fn decode_tmux_color_discards_non_sgr_sequences() {
+        assert_eq!(
+            decode_tmux_color(r#"\e]52;c;SGVsbG8=\a\e[31mplain\e[2J"#),
+            "\u{1b}[31m"
+        );
     }
 }

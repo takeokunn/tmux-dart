@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use crate::{
     config::JumpConfig,
-    jump::{bounded_subset_bounds, labels_for, positions_for},
+    jump::{bounded_subset_bounds, jump_position_for_char_index, labels_for, positions_for},
     overlay::{draw_overlay, with_recovered_screen},
     tmux::{PaneState, TmuxBackend},
 };
@@ -82,7 +82,7 @@ pub fn run_jump_report<B: TmuxBackend>(backend: &B, request: JumpRequest) -> Res
     }
     if request.config.options.auto_jump && positions.len() == 1 {
         machine.enter(JumpState::JumpToTarget);
-        backend.jump_to_position(&pane, positions[0])?;
+        backend.jump_to_position(&pane, jump_position_for_char_index(&screen, positions[0]))?;
         return Ok(machine.finish(JumpState::Done));
     }
 
@@ -100,7 +100,7 @@ pub fn run_jump_report<B: TmuxBackend>(backend: &B, request: JumpRequest) -> Res
         .get(selected_index)
         .copied()
         .context("selected index out of bounds")?;
-    backend.jump_to_position(&pane, target)?;
+    backend.jump_to_position(&pane, jump_position_for_char_index(&screen, target))?;
     Ok(machine.finish(JumpState::Done))
 }
 
@@ -128,7 +128,8 @@ pub fn select_position_index<B: TmuxBackend>(
         &labels[..positions.len()],
         &config.overlay_style,
     )?;
-    let Some(input) = backend.prompt_for_label_char("char:")? else {
+    let prompt = format_jump_prompt(positions.len(), label_len);
+    let Some(input) = backend.prompt_for_label_char(&prompt)? else {
         return Ok(None);
     };
 
@@ -158,6 +159,16 @@ pub fn select_position_index<B: TmuxBackend>(
     Ok(lower_index.map(|value| subset.start + value))
 }
 
+fn format_jump_prompt(match_count: usize, label_len: usize) -> String {
+    let match_label = if match_count == 1 { "match" } else { "matches" };
+    let label_phrase = if label_len == 1 {
+        "1-char labels".to_owned()
+    } else {
+        format!("{label_len}-char labels")
+    };
+    format!("jump char ({match_count} {match_label}, {label_phrase}):")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, collections::VecDeque};
@@ -167,15 +178,17 @@ mod tests {
     use super::{JumpRequest, JumpState, run_jump_report};
     use crate::{
         config::{EnvValues, JumpConfig},
+        jump::DisplayPosition,
         tmux::{PaneState, TmuxBackend},
     };
 
     #[derive(Default)]
     struct FakeBackend {
         screen: String,
+        prompts_seen: RefCell<Vec<String>>,
         prompts: RefCell<VecDeque<Option<char>>>,
         writes: RefCell<Vec<String>>,
-        jumped_to: RefCell<Option<usize>>,
+        jumped_to: RefCell<Option<DisplayPosition>>,
         messages: RefCell<Vec<String>>,
     }
 
@@ -183,6 +196,7 @@ mod tests {
         fn with_prompts(prompts: impl IntoIterator<Item = char>) -> Self {
             Self {
                 screen: String::from("qone qtwo qthree qfour"),
+                prompts_seen: RefCell::default(),
                 prompts: RefCell::new(prompts.into_iter().map(Some).collect()),
                 writes: RefCell::default(),
                 jumped_to: RefCell::default(),
@@ -193,6 +207,7 @@ mod tests {
         fn with_prompt_results(prompts: impl IntoIterator<Item = Option<char>>) -> Self {
             Self {
                 screen: String::from("qone qtwo qthree qfour"),
+                prompts_seen: RefCell::default(),
                 prompts: RefCell::new(prompts.into_iter().collect()),
                 writes: RefCell::default(),
                 jumped_to: RefCell::default(),
@@ -241,7 +256,8 @@ mod tests {
             Ok(())
         }
 
-        fn prompt_for_label_char(&self, _prompt: &str) -> Result<Option<char>> {
+        fn prompt_for_label_char(&self, prompt: &str) -> Result<Option<char>> {
+            self.prompts_seen.borrow_mut().push(prompt.to_owned());
             Ok(self.prompts.borrow_mut().pop_front().flatten())
         }
 
@@ -250,7 +266,7 @@ mod tests {
             Ok(())
         }
 
-        fn jump_to_position(&self, _pane: &PaneState, jump_to: usize) -> Result<()> {
+        fn jump_to_position(&self, _pane: &PaneState, jump_to: DisplayPosition) -> Result<()> {
             *self.jumped_to.borrow_mut() = Some(jump_to);
             Ok(())
         }
@@ -280,8 +296,15 @@ mod tests {
                 JumpState::Done,
             ]
         );
-        assert_eq!(*backend.jumped_to.borrow(), Some(5));
+        assert_eq!(
+            *backend.jumped_to.borrow(),
+            Some(DisplayPosition { row: 0, column: 5 })
+        );
         assert_eq!(backend.writes.borrow().len(), 3);
+        assert_eq!(
+            backend.prompts_seen.borrow().as_slice(),
+            ["jump char (4 matches, 1-char labels):"]
+        );
         assert!(
             backend
                 .writes
@@ -290,6 +313,26 @@ mod tests {
                 .any(|write| write.contains('f'))
         );
         assert!(backend.messages.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn jump_flow_formats_prompt_with_match_count_and_label_depth() -> Result<()> {
+        let backend = FakeBackend::with_prompts(['f']);
+        let config = JumpConfig::from_values(EnvValues::default());
+        let _ = run_jump_report(
+            &backend,
+            JumpRequest {
+                initial_char: 'q',
+                pane_id: None,
+                config,
+            },
+        )?;
+
+        assert_eq!(
+            backend.prompts_seen.borrow().as_slice(),
+            ["jump char (4 matches, 1-char labels):"]
+        );
         Ok(())
     }
 
@@ -315,7 +358,10 @@ mod tests {
                 JumpState::Done,
             ]
         );
-        assert_eq!(*backend.jumped_to.borrow(), Some(0));
+        assert_eq!(
+            *backend.jumped_to.borrow(),
+            Some(DisplayPosition { row: 0, column: 0 })
+        );
         assert!(backend.writes.borrow().is_empty());
         assert!(backend.messages.borrow().is_empty());
         Ok(())
@@ -345,7 +391,36 @@ mod tests {
                 JumpState::Done,
             ]
         );
-        assert_eq!(*backend.jumped_to.borrow(), Some(1));
+        assert_eq!(
+            *backend.jumped_to.borrow(),
+            Some(DisplayPosition { row: 0, column: 1 })
+        );
+        assert!(backend.writes.borrow().is_empty());
+        assert!(backend.messages.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn jump_flow_lands_on_character_column_after_wide_characters() -> Result<()> {
+        // Regression guard: with wide (East Asian) characters before the target,
+        // the copy-mode jump must move by logical characters, not display cells.
+        // 'z' sits at char index 4 (あ,い,う,space each count once), even though
+        // its display column is 7.
+        let backend = FakeBackend::default().with_screen("あいう z");
+        let report = run_jump_report(
+            &backend,
+            JumpRequest {
+                initial_char: 'z',
+                pane_id: None,
+                config: JumpConfig::from_values(EnvValues::default()),
+            },
+        )?;
+
+        assert_eq!(report.state, JumpState::Done);
+        assert_eq!(
+            *backend.jumped_to.borrow(),
+            Some(DisplayPosition { row: 0, column: 4 })
+        );
         assert!(backend.writes.borrow().is_empty());
         assert!(backend.messages.borrow().is_empty());
         Ok(())
@@ -377,7 +452,10 @@ mod tests {
             ]
         );
         // Slashes sit at indices 1 and 3; label 'f' is the second label key.
-        assert_eq!(*backend.jumped_to.borrow(), Some(3));
+        assert_eq!(
+            *backend.jumped_to.borrow(),
+            Some(DisplayPosition { row: 0, column: 3 })
+        );
         assert!(!backend.writes.borrow().is_empty());
         assert!(backend.messages.borrow().is_empty());
         Ok(())

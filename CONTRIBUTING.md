@@ -50,7 +50,7 @@ Unit tests are co-located with source code in `#[cfg(test)]` modules.
 ### Linting
 
 ```bash
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 ```
 
 The project enforces strict clippy rules (see Coding Conventions below).
@@ -69,7 +69,7 @@ The tmux plugin entrypoint is POSIX-compatible Bash. Syntax errors here prevent 
 nix flake check
 ```
 
-This runs `bash -n`, `cargo fmt --check`, and the package build (which includes `cargo test`) inside a Nix sandbox. This is the single command that verifies everything.
+This runs `bash -n`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and the package build (which includes `cargo test`) inside a Nix sandbox. This is the single command that verifies the main release checks.
 
 ## Coding Conventions
 
@@ -124,7 +124,7 @@ tmux -L tmux-dart-clean kill-server
 3. Ensure all checks pass before requesting review:
     - `cargo test`
     - `cargo fmt --check`
-    - `cargo clippy -- -D warnings`
+    - `cargo clippy --all-targets -- -D warnings`
     - `bash -n tmux-dart.tmux`
 4. Include tests for new behavior and note any manual smoke testing you performed.
 

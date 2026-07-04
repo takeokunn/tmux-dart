@@ -9,7 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Jumps now land on the correct cell when a line contains wide (East Asian) characters: copy-mode `cursor-right` is driven by a character count, while overlay labels keep using display columns.
 - In default `word` mode, non-word targets (punctuation, symbols, whitespace such as `/`) now match every occurrence instead of reporting no match.
+- `--char` now rejects empty or multi-character values instead of truncating them silently.
+- `--char-file` now requires a single character and tolerates a trailing newline instead of truncating multi-character content.
+
+### Added
+
+- Overlay theme presets via `@jump-theme` for `classic`, `contrast`, and `soft`
+- `@jump-keys-position` support for `left`, `right`, and `off_left`
+- Prompt text that reflects the number of matches and label depth before selection begins
 
 ## [0.1.0] - 2026-05-18
 

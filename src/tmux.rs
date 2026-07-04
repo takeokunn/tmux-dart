@@ -6,8 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use tempfile::NamedTempFile;
+
+use crate::jump::DisplayPosition;
 
 #[derive(Debug, Clone)]
 pub struct PaneState {
@@ -30,7 +32,7 @@ pub trait TmuxBackend {
     fn write_to_tty(&self, pane: &PaneState, content: &str) -> Result<()>;
     fn prompt_for_label_char(&self, prompt: &str) -> Result<Option<char>>;
     fn display_message(&self, message: &str) -> Result<()>;
-    fn jump_to_position(&self, pane: &PaneState, jump_to: usize) -> Result<()>;
+    fn jump_to_position(&self, pane: &PaneState, jump_to: DisplayPosition) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -69,7 +71,7 @@ impl TmuxBackend for RealTmux {
         display_message(message)
     }
 
-    fn jump_to_position(&self, pane: &PaneState, jump_to: usize) -> Result<()> {
+    fn jump_to_position(&self, pane: &PaneState, jump_to: DisplayPosition) -> Result<()> {
         jump_to_position(pane, jump_to)
     }
 }
@@ -151,7 +153,7 @@ pub fn prompt_for_label_char(prompt: &str) -> Result<Option<char>> {
         "-1",
         "-p",
         prompt,
-        &format!(r#"run-shell "printf '%1' > {quoted_path}""#),
+        &prompt_for_label_char_command(&quoted_path),
     ])?;
     let previous_activity = session_activity()?;
 
@@ -168,7 +170,7 @@ fn wait_for_char_file(
     let activity_change_grace_period = Duration::from_millis(250);
 
     loop {
-        if let Some(ch) = read_first_char_from_file(path)? {
+        if let Some(ch) = read_single_char_from_file(path)? {
             return Ok(Some(ch));
         }
 
@@ -187,53 +189,125 @@ fn wait_for_char_file(
     }
 }
 
-fn read_first_char_from_file(path: &str) -> Result<Option<char>> {
+fn read_single_char_from_file(path: &str) -> Result<Option<char>> {
     match fs::read_to_string(path) {
-        Ok(content) => Ok(content.chars().next()),
+        Ok(content) => parse_single_char_content(&content),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to read prompt file {path}")),
     }
 }
 
-pub fn jump_to_position(pane: &PaneState, jump_to: usize) -> Result<()> {
-    tmux_success(["copy-mode", "-t", &pane.pane_id])?;
-    tmux_success(["send-keys", "-X", "-t", &pane.pane_id, "start-of-line"])?;
-    tmux_success(["send-keys", "-X", "-t", &pane.pane_id, "top-line"])?;
-    tmux_success([
-        "send-keys",
-        "-X",
-        "-t",
-        &pane.pane_id,
-        "-N",
-        "200",
-        "cursor-right",
-    ])?;
-    tmux_success(["send-keys", "-X", "-t", &pane.pane_id, "start-of-line"])?;
-    tmux_success(["send-keys", "-X", "-t", &pane.pane_id, "top-line"])?;
-    if pane.scroll_position > 0 {
-        tmux_success([
-            "send-keys",
-            "-X",
-            "-t",
-            &pane.pane_id,
-            "-N",
-            &pane.scroll_position.to_string(),
-            "cursor-up",
-        ])?;
+fn parse_single_char_content(content: &str) -> Result<Option<char>> {
+    let content = strip_optional_line_ending(content);
+    if content.is_empty() {
+        return Ok(None);
     }
-    if jump_to > 0 {
-        tmux_success([
-            "send-keys",
-            "-X",
-            "-t",
-            &pane.pane_id,
-            "-N",
-            &jump_to.to_string(),
-            "cursor-right",
-        ])?;
+
+    let mut chars = content.chars();
+    let Some(first) = chars.next() else {
+        return Ok(None);
+    };
+    ensure!(
+        chars.next().is_none(),
+        "prompt file must contain exactly one character"
+    );
+    Ok(Some(first))
+}
+
+fn strip_optional_line_ending(content: &str) -> &str {
+    if let Some(stripped) = content.strip_suffix("\r\n") {
+        stripped
+    } else if let Some(stripped) = content.strip_suffix('\n') {
+        stripped
+    } else {
+        content
+    }
+}
+
+pub fn jump_to_position(pane: &PaneState, jump_to: DisplayPosition) -> Result<()> {
+    for command in copy_mode_jump_commands(pane, jump_to) {
+        send_copy_mode_jump_command(pane, command)?;
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyModeJumpCommand {
+    CopyMode,
+    StartOfLine,
+    TopLine,
+    CursorUp(usize),
+    CursorDown(usize),
+    CursorRight(usize),
+}
+
+fn copy_mode_jump_commands(pane: &PaneState, jump_to: DisplayPosition) -> Vec<CopyModeJumpCommand> {
+    let mut commands = vec![
+        CopyModeJumpCommand::CopyMode,
+        CopyModeJumpCommand::StartOfLine,
+        CopyModeJumpCommand::TopLine,
+    ];
+
+    if pane.scroll_position > 0 {
+        commands.push(CopyModeJumpCommand::CursorUp(pane.scroll_position));
+    }
+    if jump_to.row > 0 {
+        commands.push(CopyModeJumpCommand::CursorDown(jump_to.row));
+    }
+    if jump_to.column > 0 {
+        commands.push(CopyModeJumpCommand::CursorRight(jump_to.column));
+    }
+
+    commands
+}
+
+fn send_copy_mode_jump_command(pane: &PaneState, command: CopyModeJumpCommand) -> Result<()> {
+    match command {
+        CopyModeJumpCommand::CopyMode => tmux_success(["copy-mode", "-t", &pane.pane_id]),
+        CopyModeJumpCommand::StartOfLine => {
+            tmux_success(["send-keys", "-X", "-t", &pane.pane_id, "start-of-line"])
+        }
+        CopyModeJumpCommand::TopLine => {
+            tmux_success(["send-keys", "-X", "-t", &pane.pane_id, "top-line"])
+        }
+        CopyModeJumpCommand::CursorUp(count) => {
+            let count = count.to_string();
+            tmux_success([
+                "send-keys",
+                "-X",
+                "-t",
+                &pane.pane_id,
+                "-N",
+                &count,
+                "cursor-up",
+            ])
+        }
+        CopyModeJumpCommand::CursorDown(count) => {
+            let count = count.to_string();
+            tmux_success([
+                "send-keys",
+                "-X",
+                "-t",
+                &pane.pane_id,
+                "-N",
+                &count,
+                "cursor-down",
+            ])
+        }
+        CopyModeJumpCommand::CursorRight(count) => {
+            let count = count.to_string();
+            tmux_success([
+                "send-keys",
+                "-X",
+                "-t",
+                &pane.pane_id,
+                "-N",
+                &count,
+                "cursor-right",
+            ])
+        }
+    }
 }
 
 fn session_activity() -> Result<String> {
@@ -294,9 +368,18 @@ fn tmux_success<const N: usize>(args: [&str; N]) -> Result<()> {
     tmux_output(args).map(|_| ())
 }
 
+fn prompt_for_label_char_command(quoted_path: &str) -> String {
+    format!(r#"run-shell "printf '%s' '%%%' > {quoted_path}""#)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{shell_quote, trim_single_trailing_newline};
+    use super::{
+        CopyModeJumpCommand, copy_mode_jump_commands, parse_single_char_content,
+        prompt_for_label_char_command, shell_quote, trim_single_trailing_newline,
+    };
+
+    use crate::jump::DisplayPosition;
 
     #[test]
     fn capture_output_only_trims_tmuxs_final_newline() {
@@ -309,5 +392,87 @@ mod tests {
     fn shell_quote_handles_spaces_and_quotes() {
         assert_eq!(shell_quote("/tmp/tmux dart"), "'/tmp/tmux dart'");
         assert_eq!(shell_quote("/tmp/a'b"), "'/tmp/a'\\''b'");
+    }
+
+    #[test]
+    fn prompt_for_label_char_command_escapes_prompt_input() {
+        assert_eq!(
+            prompt_for_label_char_command("' /tmp/path '"),
+            r#"run-shell "printf '%s' '%%%' > ' /tmp/path '""#
+        );
+    }
+
+    #[test]
+    fn parse_single_char_content_accepts_single_character_with_newline() {
+        assert!(matches!(parse_single_char_content("Z\n"), Ok(Some('Z'))));
+    }
+
+    #[test]
+    fn parse_single_char_content_accepts_single_character_with_crlf() {
+        assert!(matches!(parse_single_char_content("Z\r\n"), Ok(Some('Z'))));
+    }
+
+    #[test]
+    fn parse_single_char_content_rejects_multiple_characters() {
+        assert!(parse_single_char_content("ab").is_err());
+    }
+
+    #[test]
+    fn parse_single_char_content_rejects_multiple_characters_with_newline() {
+        assert!(parse_single_char_content("ab\n").is_err());
+    }
+
+    #[test]
+    fn parse_single_char_content_rejects_extra_trailing_newlines() {
+        assert!(parse_single_char_content("Z\n\n").is_err());
+    }
+
+    #[test]
+    fn parse_single_char_content_returns_none_for_empty_input() {
+        assert!(matches!(parse_single_char_content(""), Ok(None)));
+    }
+
+    #[test]
+    fn copy_mode_jump_commands_use_display_rows_and_columns() {
+        let pane = pane_with_scroll_position(3);
+
+        assert_eq!(
+            copy_mode_jump_commands(&pane, DisplayPosition { row: 2, column: 5 }),
+            vec![
+                CopyModeJumpCommand::CopyMode,
+                CopyModeJumpCommand::StartOfLine,
+                CopyModeJumpCommand::TopLine,
+                CopyModeJumpCommand::CursorUp(3),
+                CopyModeJumpCommand::CursorDown(2),
+                CopyModeJumpCommand::CursorRight(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_mode_jump_commands_omit_zero_distance_moves() {
+        let pane = pane_with_scroll_position(0);
+
+        assert_eq!(
+            copy_mode_jump_commands(&pane, DisplayPosition { row: 0, column: 0 }),
+            vec![
+                CopyModeJumpCommand::CopyMode,
+                CopyModeJumpCommand::StartOfLine,
+                CopyModeJumpCommand::TopLine,
+            ]
+        );
+    }
+
+    fn pane_with_scroll_position(scroll_position: usize) -> super::PaneState {
+        super::PaneState {
+            pane_id: String::from("%0"),
+            tty_path: String::from("/dev/null"),
+            in_copy_mode: false,
+            cursor_y: 0,
+            cursor_x: 0,
+            alternate_on: false,
+            scroll_position,
+            pane_height: 24,
+        }
     }
 }
