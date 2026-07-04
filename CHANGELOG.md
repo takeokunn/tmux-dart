@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Jumps no longer drift inside TUIs (vim splits, htop, anything with a fixed header/footer). Such apps narrow the terminal scroll region (`DECSTBM`), which `ESC[2J` does not clear; painting the multi-match overlay and restoring the screen then scrolled inside that stale region and shifted every row. The overlay and restore now reset the scroll region (`ESC[r`) before repainting, and the restore homes the cursor explicitly instead of relying on the overlay having left it there.
 - Jumps now land on the correct cell when a line contains wide (East Asian) characters: copy-mode `cursor-right` is driven by a character count, while overlay labels keep using display columns.
 - In default `word` mode, non-word targets (punctuation, symbols, whitespace such as `/`) now match every occurrence instead of reporting no match.
 - `--char` now rejects empty or multi-character values instead of truncating them silently.

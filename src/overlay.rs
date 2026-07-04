@@ -8,9 +8,19 @@ use crate::{
 
 const CLEAR_SEQ: &str = "\u{1b}[2J";
 const HOME_SEQ: &str = "\u{1b}[H";
-const CLEAR_HOME_SEQ: &str = concat!("\u{1b}[2J", "\u{1b}[H");
+/// Reset the scroll region (DECSTBM) to the full screen. A TUI (vim splits,
+/// anything with a fixed header/footer) narrows the scroll region with
+/// `ESC[top;bottom r`; `ESC[2J` does *not* clear it. Without this reset, the
+/// line feeds we emit while painting the overlay or restoring the screen scroll
+/// *within* the stale region and shift every row — the "drift" that only shows
+/// up inside TUIs. Emitting it before any multi-line write makes line feeds
+/// behave normally again.
+const RESET_SCROLL_REGION: &str = "\u{1b}[r";
+/// Reset the scroll region, clear, and home — the standard prelude before
+/// repainting a whole screen's worth of lines.
+const RESET_CLEAR_HOME_SEQ: &str = concat!("\u{1b}[r", "\u{1b}[2J", "\u{1b}[H");
 const RESET_COLORS: &str = "\u{1b}[0m";
-const ENTER_ALTERNATE_HOME_SEQ: &str = concat!("\u{1b}[?1049h", "\u{1b}[H");
+const ENTER_ALTERNATE_HOME_SEQ: &str = concat!("\u{1b}[?1049h", "\u{1b}[r", "\u{1b}[H");
 const RESTORE_NORMAL_SCREEN: &str = "\u{1b}[?1049l";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,20 +137,35 @@ where
     F: FnOnce() -> Result<T>,
 {
     let saved_screen = backend.capture_pane_with_escapes(&pane.pane_id)?;
-    backend.write_to_tty(pane, CLEAR_HOME_SEQ)?;
+    backend.write_to_tty(pane, RESET_CLEAR_HOME_SEQ)?;
     let action_result = action();
 
-    let mut restore = String::from(RESET_COLORS);
-    restore.push_str(CLEAR_SEQ);
-    restore.push_str(&saved_screen.replace('\n', "\n\r"));
-    restore.push_str(&format!(
-        "\u{1b}[{};{}H",
-        pane.cursor_y + 1,
-        pane.cursor_x + 1
-    ));
-    restore.push_str(RESET_COLORS);
+    let restore = alternate_screen_restore_sequence(&saved_screen, pane.cursor_y, pane.cursor_x);
     let restore_result = backend.write_to_tty(pane, &restore);
     action_result.and_then(|v| restore_result.map(|()| v))
+}
+
+/// Build the byte sequence that repaints `saved_screen` (captured with `-e`, so
+/// it still carries its SGR colors) and parks the cursor back where the TUI left
+/// it. Resets the scroll region first: `saved_screen` is written line by line
+/// with `\n\r`, and a narrowed scroll region would scroll those line feeds
+/// instead of advancing rows, shifting the whole grid — see
+/// [`RESET_SCROLL_REGION`].
+pub fn alternate_screen_restore_sequence(
+    saved_screen: &str,
+    cursor_y: usize,
+    cursor_x: usize,
+) -> String {
+    let mut restore = String::from(RESET_COLORS);
+    restore.push_str(RESET_SCROLL_REGION);
+    restore.push_str(CLEAR_SEQ);
+    // Home explicitly rather than assuming the caller left the cursor there: the
+    // saved rows below are written sequentially, so they must start at row 1.
+    restore.push_str(HOME_SEQ);
+    restore.push_str(&saved_screen.replace('\n', "\n\r"));
+    restore.push_str(&format!("\u{1b}[{};{}H", cursor_y + 1, cursor_x + 1));
+    restore.push_str(RESET_COLORS);
+    restore
 }
 
 pub fn draw_overlay<B: TmuxBackend + ?Sized>(
@@ -161,7 +186,7 @@ fn render_overlay(
     style: &OverlayStyle,
 ) -> String {
     let mut rendered = String::new();
-    rendered.push_str(CLEAR_HOME_SEQ);
+    rendered.push_str(RESET_CLEAR_HOME_SEQ);
     rendered.push_str(&style.background);
     rendered.push_str(&screen.replace('\n', "\n\r"));
 
@@ -201,7 +226,9 @@ fn render_overlay(
 
 #[cfg(test)]
 mod tests {
-    use super::{OverlayStyle, decode_tmux_color, render_overlay};
+    use super::{
+        OverlayStyle, alternate_screen_restore_sequence, decode_tmux_color, render_overlay,
+    };
     use crate::jump::KeyPosition;
 
     fn style(key_position: KeyPosition) -> OverlayStyle {
@@ -224,8 +251,49 @@ mod tests {
             &style(KeyPosition::Left),
         );
 
-        assert!(rendered.starts_with("\u{1b}[2J\u{1b}[HBGab\n\rcd"));
+        // The scroll region is reset (`ESC[r`) before the clear+home so the
+        // `\n\r` line feeds below never scroll inside a TUI's stale region.
+        assert!(rendered.starts_with("\u{1b}[r\u{1b}[2J\u{1b}[HBGab\n\rcd"));
         assert!(rendered.ends_with("\u{1b}[H"));
+    }
+
+    #[test]
+    fn render_overlay_resets_scroll_region_before_any_line_feed() {
+        // Regression guard for the TUI drift bug: the scroll-region reset must
+        // come before the first `\n\r`, otherwise painting the overlay scrolls
+        // the pane and every jump target lands a row (or more) off.
+        let positions = [0usize];
+        let labels = [String::from("j")];
+        let rendered = render_overlay(
+            "one\ntwo\nthree",
+            &positions[..],
+            &labels[..],
+            &style(KeyPosition::Left),
+        );
+
+        let reset = rendered.find("\u{1b}[r");
+        let first_line_feed = rendered.find("\n\r");
+        assert!(
+            matches!((reset, first_line_feed), (Some(r), Some(lf)) if r < lf),
+            "scroll-region reset must precede the first line feed"
+        );
+    }
+
+    #[test]
+    fn alternate_screen_restore_resets_scroll_region_before_repaint() {
+        // The restore repaints the saved TUI screen with `\n\r` per row, so it
+        // must also neutralize a narrowed scroll region first — the same drift
+        // source as the overlay, on the way back out.
+        let restore = alternate_screen_restore_sequence("row-a\nrow-b\nrow-c", 2, 4);
+
+        let reset = restore.find("\u{1b}[r");
+        let first_line_feed = restore.find("\n\r");
+        assert!(
+            matches!((reset, first_line_feed), (Some(r), Some(lf)) if r < lf),
+            "scroll-region reset must precede the first repainted line feed"
+        );
+        // Cursor is parked back at the TUI's 1-based position (row 3, col 5).
+        assert!(restore.contains("\u{1b}[3;5H"));
     }
 
     #[test]

@@ -133,6 +133,42 @@ impl Server {
         ])?;
         Ok((parse_i64(&x)?, parse_i64(&y)?))
     }
+
+    /// Capture the visible grid as plain text (no escapes), one line per row.
+    fn capture_plain(&self, pane: &str, rows: u16) -> Result<String> {
+        self.tmux(&[
+            "capture-pane",
+            "-p",
+            "-t",
+            pane,
+            "-S",
+            "0",
+            "-E",
+            &(rows - 1).to_string(),
+        ])
+    }
+
+    /// Capture the visible grid with SGR escapes retained — the exact input the
+    /// overlay restore repaints from.
+    fn capture_escaped(&self, pane: &str) -> Result<String> {
+        self.tmux(&["capture-pane", "-e", "-p", "-t", pane])
+    }
+
+    /// Write raw bytes to the pane's slave tty, exactly as the overlay code does
+    /// via `write_to_tty` — tmux processes them and updates the pane grid.
+    fn write_pane_tty(&self, pane: &str, bytes: &str) -> Result<()> {
+        use std::io::Write;
+        let tty = self.tmux(&["display-message", "-p", "-t", pane, "-F", "#{pane_tty}"])?;
+        let mut handle = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&tty)
+            .with_context(|| format!("open pane tty {tty}"))?;
+        handle
+            .write_all(bytes.as_bytes())
+            .context("write pane tty")?;
+        handle.flush().context("flush pane tty")?;
+        Ok(())
+    }
 }
 
 impl Drop for Server {
@@ -293,4 +329,65 @@ fn jumps_to_the_correct_cell_after_wide_characters() -> Result<()> {
     assert_jump("あいう z", 80, 24, "z", "word", (7, 0))?;
     // Same, one row down and with a shorter wide run: grid column 5, row 1.
     assert_jump("top\\nかき z", 80, 24, "z", "word", (5, 1))
+}
+
+#[test]
+fn overlay_restore_does_not_drift_under_a_scroll_region() -> Result<()> {
+    require_tmux!();
+    // Regression guard for the reported TUI drift: a full-screen app (vim split,
+    // htop, anything with a fixed header/footer) narrows the scroll region with
+    // DECSTBM (`ESC[top;bottom r`). The multi-match overlay path repaints the
+    // saved screen line by line; if it does not reset that region first, every
+    // `\n` scrolls *inside* the region and shifts the whole grid, so the jump —
+    // computed against the pre-overlay capture — lands rows off. The restore
+    // sequence must round-trip the grid unchanged.
+    let cols = 40u16;
+    let rows = 10u16;
+    // Enter the alternate screen, draw distinct rows, then reserve a header
+    // (rows 1-2) and footer (row `rows`) by setting the scroll region to
+    // rows 3..rows-1, and park the cursor inside it — just like a real TUI.
+    let body = (0..rows)
+        .map(|r| format!("ROW{r:02} zebra"))
+        .collect::<Vec<_>>()
+        .join("\\r\\n");
+    let content = format!("\\033[?1049h\\033[H{body}\\033[3;{}r\\033[5;1H", rows - 1);
+    let (server, pane) = Server::start(&content, cols, rows)?;
+
+    assert_eq!(
+        server.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            &pane,
+            "-F",
+            "#{alternate_on}"
+        ])?,
+        "1",
+        "the fixture must be on the alternate screen"
+    );
+
+    let before = server.capture_plain(&pane, rows)?;
+    let saved = server.capture_escaped(&pane)?;
+    // Drive the exact production restore sequence against the live pane.
+    let restore = tmux_dart::overlay::alternate_screen_restore_sequence(&saved, 0, 0);
+    server.write_pane_tty(&pane, &restore)?;
+    sleep(Duration::from_millis(100));
+    let after = server.capture_plain(&pane, rows)?;
+
+    assert_eq!(
+        trim_trailing_ws(&before),
+        trim_trailing_ws(&after),
+        "restoring the screen under a scroll region shifted the grid (TUI drift)"
+    );
+    Ok(())
+}
+
+/// Compare grids ignoring per-line trailing spaces, which `capture-pane` may or
+/// may not emit depending on where content ends.
+fn trim_trailing_ws(screen: &str) -> String {
+    screen
+        .lines()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
