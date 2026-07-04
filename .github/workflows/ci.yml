@@ -27,13 +27,3 @@ jobs:
           name: takeokunn-tmux-dart
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
       - run: nix flake check
-  rust:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@v31
-      - uses: cachix/cachix-action@v17
-        with:
-          name: takeokunn-tmux-dart
-          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
-      - run: nix develop --command bash -c 'cargo test && cargo clippy --all-targets -- -D warnings'
