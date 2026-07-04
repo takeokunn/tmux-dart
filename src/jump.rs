@@ -36,8 +36,29 @@ impl KeyPosition {
     }
 }
 
+/// Anchor for drawing an overlay label. `column` is a **display** column: each
+/// character contributes its terminal width, so a wide (East Asian) character
+/// counts as two. This matches the ANSI absolute cursor positioning
+/// (`ESC[row;colH`) the overlay uses.
+///
+/// Deliberately a distinct type from [`JumpTarget`]: the two carry different
+/// column metrics and must never be interchanged. Keeping them separate turns a
+/// mix-up into a compile error instead of a silent wide-character drift bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DisplayPosition {
+pub struct OverlayAnchor {
+    pub row: usize,
+    pub column: usize,
+}
+
+/// Target for driving copy-mode navigation. `column` is a **character** count
+/// from the start of the row. tmux's `cursor-right` skips the padding cell of a
+/// wide character, so one press moves exactly one logical character regardless
+/// of display width; counting display cells would overshoot on any line
+/// containing wide characters.
+///
+/// Deliberately a distinct type from [`OverlayAnchor`] — see its docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JumpTarget {
     pub row: usize,
     pub column: usize,
 }
@@ -46,21 +67,18 @@ fn is_word_char(ch: char) -> bool {
     ch == '_' || ch.is_alphanumeric()
 }
 
-/// Row/column for drawing an overlay label. `column` is a **display** column:
-/// each character contributes its terminal width, so a wide (East Asian)
-/// character counts as two. This matches ANSI absolute cursor positioning
-/// (`ESC[row;colH`) used by the overlay.
-pub fn display_position_for_char_index(screen: &str, target_index: usize) -> DisplayPosition {
-    position_for_char_index(screen, target_index, ColumnMetric::DisplayWidth)
+/// Locate the character at `target_index` for overlay label placement. See
+/// [`OverlayAnchor`] for why the column is measured in display cells.
+pub fn overlay_anchor_for_char_index(screen: &str, target_index: usize) -> OverlayAnchor {
+    let (row, column) = row_and_column(screen, target_index, ColumnMetric::DisplayWidth);
+    OverlayAnchor { row, column }
 }
 
-/// Row/column for driving copy-mode `cursor-right`. `column` is a **character**
-/// count from the start of the row. tmux's `cursor-right` skips the padding
-/// cell of a wide character, so one press moves exactly one logical character
-/// regardless of display width; counting display cells would overshoot on any
-/// line containing wide characters.
-pub fn jump_position_for_char_index(screen: &str, target_index: usize) -> DisplayPosition {
-    position_for_char_index(screen, target_index, ColumnMetric::CharCount)
+/// Locate the character at `target_index` for copy-mode navigation. See
+/// [`JumpTarget`] for why the column is measured in characters.
+pub fn jump_target_for_char_index(screen: &str, target_index: usize) -> JumpTarget {
+    let (row, column) = row_and_column(screen, target_index, ColumnMetric::CharCount);
+    JumpTarget { row, column }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,17 +87,13 @@ enum ColumnMetric {
     CharCount,
 }
 
-fn position_for_char_index(
-    screen: &str,
-    target_index: usize,
-    metric: ColumnMetric,
-) -> DisplayPosition {
+fn row_and_column(screen: &str, target_index: usize, metric: ColumnMetric) -> (usize, usize) {
     let mut row = 0usize;
     let mut column = 0usize;
 
     for (index, ch) in screen.chars().enumerate() {
         if index == target_index {
-            return DisplayPosition { row, column };
+            return (row, column);
         }
 
         if ch == '\n' {
@@ -93,7 +107,7 @@ fn position_for_char_index(
         }
     }
 
-    DisplayPosition { row, column }
+    (row, column)
 }
 
 pub fn positions_of(target: char, screen: &str) -> Vec<usize> {
@@ -188,27 +202,57 @@ fn line_positions(target: char, chars: &[char], case_sensitive: bool) -> Vec<usi
     positions
 }
 
-pub fn label_keys_from_env(value: &str) -> Vec<char> {
-    let mut keys = Vec::new();
-    for ch in value.chars().filter(|ch| !ch.is_whitespace()) {
-        if !keys.contains(&ch) {
-            keys.push(ch);
+/// A validated set of label keys: always at least two unique, non-whitespace
+/// characters. Because the invariant is enforced at construction, downstream
+/// code (label expansion, recursive subset selection) never has to re-check
+/// that there are "enough" keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelKeys(Vec<char>);
+
+impl LabelKeys {
+    /// Parse label keys from a raw option value, keeping the first occurrence of
+    /// each non-whitespace character. Falls back to [`LabelKeys::default`] when
+    /// fewer than two distinct keys remain, since a single key cannot form a
+    /// distinguishable label alphabet.
+    pub fn from_env(value: &str) -> Self {
+        let mut keys = Vec::new();
+        for ch in value.chars().filter(|ch| !ch.is_whitespace()) {
+            if !keys.contains(&ch) {
+                keys.push(ch);
+            }
+        }
+
+        if keys.len() < 2 {
+            Self::default()
+        } else {
+            Self(keys)
         }
     }
 
-    if keys.len() < 2 {
-        DEFAULT_LABEL_KEYS.to_vec()
-    } else {
-        keys
+    pub fn as_slice(&self) -> &[char] {
+        &self.0
+    }
+
+    /// Number of distinct keys. Always `>= 2` by construction.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Always `false`: a `LabelKeys` is never empty. Present so the type reads
+    /// naturally alongside `len` (and satisfies `clippy::len_without_is_empty`).
+    pub fn is_empty(&self) -> bool {
+        false
     }
 }
 
-pub fn labels_for(position_count: usize, label_keys: &[char]) -> Vec<String> {
-    let label_keys = if label_keys.len() < 2 {
-        DEFAULT_LABEL_KEYS.as_slice()
-    } else {
-        label_keys
-    };
+impl Default for LabelKeys {
+    fn default() -> Self {
+        Self(DEFAULT_LABEL_KEYS.to_vec())
+    }
+}
+
+pub fn labels_for(position_count: usize, label_keys: &LabelKeys) -> Vec<String> {
+    let label_keys = label_keys.as_slice();
     let mut labels: Vec<String> = label_keys.iter().map(char::to_string).collect();
     while position_count > labels.len() {
         labels = labels
@@ -223,7 +267,7 @@ pub fn labels_for(position_count: usize, label_keys: &[char]) -> Vec<String> {
     labels
 }
 
-pub fn label_length_for(position_count: usize, label_keys: &[char]) -> usize {
+pub fn label_length_for(position_count: usize, label_keys: &LabelKeys) -> usize {
     labels_for(position_count, label_keys)
         .first()
         .map(|s| s.chars().count())
@@ -257,11 +301,12 @@ pub fn bounded_subset_bounds(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_LABEL_KEYS, MatchMode, bounded_subset_bounds, label_keys_from_env,
-        label_length_for, labels_for, positions_for, positions_of, subset_bounds,
+        DEFAULT_LABEL_KEYS, LabelKeys, MatchMode, bounded_subset_bounds, label_length_for,
+        labels_for, positions_for, positions_of, subset_bounds,
     };
     use crate::jump::{
-        DisplayPosition, KeyPosition, display_position_for_char_index, jump_position_for_char_index,
+        JumpTarget, KeyPosition, OverlayAnchor, jump_target_for_char_index,
+        overlay_anchor_for_char_index,
     };
 
     #[test]
@@ -318,54 +363,62 @@ mod tests {
     }
 
     #[test]
-    fn display_position_uses_display_width_and_newlines() {
+    fn overlay_anchor_uses_display_width_and_newlines() {
         assert_eq!(
-            display_position_for_char_index("あいう x\nab", 4),
-            DisplayPosition { row: 0, column: 7 }
+            overlay_anchor_for_char_index("あいう x\nab", 4),
+            OverlayAnchor { row: 0, column: 7 }
         );
         assert_eq!(
-            display_position_for_char_index("あいう x\nab", 6),
-            DisplayPosition { row: 1, column: 0 }
+            overlay_anchor_for_char_index("あいう x\nab", 6),
+            OverlayAnchor { row: 1, column: 0 }
         );
     }
 
     #[test]
-    fn jump_position_counts_characters_not_display_width() {
+    fn jump_target_counts_characters_not_display_width() {
         // Copy-mode `cursor-right` skips a wide character's padding cell, so the
         // jump must count one column per logical character. The overlay, by
         // contrast, needs display cells. Both must agree on the row.
         let screen = "あいう z\nab";
         assert_eq!(
-            jump_position_for_char_index(screen, 4),
-            DisplayPosition { row: 0, column: 4 }
+            jump_target_for_char_index(screen, 4),
+            JumpTarget { row: 0, column: 4 }
         );
         assert_eq!(
-            display_position_for_char_index(screen, 4),
-            DisplayPosition { row: 0, column: 7 }
+            overlay_anchor_for_char_index(screen, 4),
+            OverlayAnchor { row: 0, column: 7 }
         );
         // Row counting stays identical across both metrics.
         assert_eq!(
-            jump_position_for_char_index(screen, 6),
-            DisplayPosition { row: 1, column: 0 }
+            jump_target_for_char_index(screen, 6),
+            JumpTarget { row: 1, column: 0 }
         );
     }
 
     #[test]
+    fn overlay_anchor_and_jump_target_agree_on_ascii() {
+        // For pure ASCII, character count and display width coincide, so the two
+        // metrics must produce identical row/column across every index.
+        let screen = "alpha beta\ngamma delta\n";
+        for index in 0..screen.chars().count() {
+            let anchor = overlay_anchor_for_char_index(screen, index);
+            let target = jump_target_for_char_index(screen, index);
+            assert_eq!(
+                (anchor.row, anchor.column),
+                (target.row, target.column),
+                "ASCII metrics diverged at index {index}"
+            );
+        }
+    }
+
+    #[test]
     fn labels_expand_in_easymotion_order() {
+        let keys = LabelKeys::default();
+        assert_eq!(labels_for(1, &keys).len(), DEFAULT_LABEL_KEYS.len());
+        assert_eq!(label_length_for(DEFAULT_LABEL_KEYS.len(), &keys), 1);
+        assert_eq!(label_length_for(DEFAULT_LABEL_KEYS.len() + 1, &keys), 2);
         assert_eq!(
-            labels_for(1, &DEFAULT_LABEL_KEYS).len(),
-            DEFAULT_LABEL_KEYS.len()
-        );
-        assert_eq!(
-            label_length_for(DEFAULT_LABEL_KEYS.len(), &DEFAULT_LABEL_KEYS),
-            1
-        );
-        assert_eq!(
-            label_length_for(DEFAULT_LABEL_KEYS.len() + 1, &DEFAULT_LABEL_KEYS),
-            2
-        );
-        assert_eq!(
-            labels_for(DEFAULT_LABEL_KEYS.len() + 1, &DEFAULT_LABEL_KEYS).len(),
+            labels_for(DEFAULT_LABEL_KEYS.len() + 1, &keys).len(),
             DEFAULT_LABEL_KEYS.len().pow(2)
         );
     }
@@ -394,14 +447,57 @@ mod tests {
 
     #[test]
     fn supports_custom_label_keys() {
-        let keys = label_keys_from_env("abcaa");
-        assert_eq!(keys, vec!['a', 'b', 'c']);
+        let keys = LabelKeys::from_env("abcaa");
+        assert_eq!(keys.as_slice(), ['a', 'b', 'c']);
+        assert_eq!(keys.len(), 3);
+        assert!(!keys.is_empty());
         assert_eq!(
             labels_for(4, &keys),
             vec!["aa", "ab", "ac", "ba", "bb", "bc", "ca", "cb", "cc"]
         );
-        assert_eq!(label_keys_from_env("a"), DEFAULT_LABEL_KEYS.to_vec());
-        assert_eq!(label_keys_from_env("aaa"), DEFAULT_LABEL_KEYS.to_vec());
+        // Fewer than two distinct keys is not a usable alphabet -> default.
+        assert_eq!(LabelKeys::from_env("a"), LabelKeys::default());
+        assert_eq!(LabelKeys::from_env("aaa"), LabelKeys::default());
+        assert_eq!(LabelKeys::from_env("  "), LabelKeys::default());
+        assert_eq!(LabelKeys::from_env(""), LabelKeys::default());
+        // Whitespace is dropped; surrounding spaces don't defeat the alphabet.
+        assert_eq!(LabelKeys::from_env(" a b ").as_slice(), ['a', 'b']);
+    }
+
+    #[test]
+    fn label_keys_are_never_shorter_than_two() {
+        // The core invariant of LabelKeys, checked over many raw inputs.
+        for raw in ["", " ", "x", "xx", "  x  ", "\t\n", "ab", "abcabc", "j f h"] {
+            let keys = LabelKeys::from_env(raw);
+            assert!(
+                keys.len() >= 2,
+                "LabelKeys::from_env({raw:?}) yielded fewer than two keys"
+            );
+            // Keys are always unique.
+            let mut seen = std::collections::HashSet::new();
+            for key in keys.as_slice() {
+                assert!(seen.insert(*key), "duplicate label key from {raw:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn labels_are_unique_same_length_and_cover_positions() {
+        // Invariants that the recursive selection relies on, across a range of
+        // match counts and both the default and a custom alphabet.
+        for keys in [LabelKeys::default(), LabelKeys::from_env("abc")] {
+            for count in 1..=60usize {
+                let labels = labels_for(count, &keys);
+                assert!(
+                    labels.len() >= count,
+                    "labels_for({count}) produced too few labels"
+                );
+                let len = label_length_for(count, &keys);
+                assert!(labels.iter().all(|label| label.chars().count() == len));
+                let unique: std::collections::HashSet<&String> = labels.iter().collect();
+                assert_eq!(unique.len(), labels.len(), "labels_for({count}) had dupes");
+            }
+        }
     }
 
     #[test]
@@ -428,5 +524,86 @@ mod tests {
         assert_eq!(KeyPosition::from_env("right"), KeyPosition::Right);
         assert_eq!(KeyPosition::from_env("off_left"), KeyPosition::OffLeft);
         assert_eq!(KeyPosition::from_env("unknown"), KeyPosition::Left);
+    }
+
+    #[test]
+    fn subset_bounds_partition_the_position_range() {
+        // The recursive label groups must tile [0, count) with no gap or overlap
+        // for every match count that uses two-character labels. If they didn't,
+        // some targets would be unreachable or two labels would collide.
+        let keys = LabelKeys::default();
+        let k = keys.len();
+        for count in 1..=(k * k) {
+            let label_len = label_length_for(count, &keys);
+            if label_len == 1 {
+                continue;
+            }
+            let mut covered = Vec::new();
+            for key_index in 0..k {
+                if let Some(range) = bounded_subset_bounds(key_index, label_len, count, k) {
+                    covered.extend(range);
+                }
+            }
+            covered.sort_unstable();
+            assert_eq!(
+                covered,
+                (0..count).collect::<Vec<_>>(),
+                "subsets failed to tile [0, {count})"
+            );
+        }
+    }
+
+    #[test]
+    fn positions_are_sorted_in_range_and_actually_match() {
+        let screen = "Foo bar\n  baz Qux\nfoo BAR :) 4a";
+        let chars: Vec<char> = screen.chars().collect();
+        for mode in [MatchMode::Word, MatchMode::Char, MatchMode::Line] {
+            for case_sensitive in [false, true] {
+                for target in ['f', 'F', 'b', 'Q', 'o', ' ', 'z', ':', '4'] {
+                    let positions = positions_for(target, screen, mode, case_sensitive);
+                    assert!(
+                        positions.windows(2).all(|pair| pair[0] < pair[1]),
+                        "positions not strictly increasing for {target:?} {mode:?}"
+                    );
+                    for &position in &positions {
+                        assert!(position < chars.len(), "index {position} out of range");
+                        let hit = if case_sensitive {
+                            chars[position] == target
+                        } else {
+                            chars[position].to_lowercase().eq(target.to_lowercase())
+                        };
+                        assert!(
+                            hit,
+                            "index {position} does not match {target:?} in {mode:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn word_matches_are_a_subset_of_char_matches() {
+        // Word-start (and line) matching may only ever be a filter over the
+        // exhaustive char matches; it must never invent a position of its own.
+        let screen = "alpha Apple\n  beta_ban 42a\nEND";
+        for target in ['a', 'A', 'b', '4', '_', 'e'] {
+            for case_sensitive in [false, true] {
+                let char_hits: std::collections::HashSet<usize> =
+                    positions_for(target, screen, MatchMode::Char, case_sensitive)
+                        .into_iter()
+                        .collect();
+                for mode in [MatchMode::Word, MatchMode::Line] {
+                    let hits: std::collections::HashSet<usize> =
+                        positions_for(target, screen, mode, case_sensitive)
+                            .into_iter()
+                            .collect();
+                    assert!(
+                        hits.is_subset(&char_hits),
+                        "{mode:?} matches for {target:?} (cs={case_sensitive}) escaped char matches"
+                    );
+                }
+            }
+        }
     }
 }

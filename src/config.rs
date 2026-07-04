@@ -1,13 +1,13 @@
 use std::env;
 
 use crate::{
-    jump::{DEFAULT_LABEL_KEYS, KeyPosition, MatchMode, label_keys_from_env},
+    jump::{KeyPosition, LabelKeys, MatchMode},
     overlay::{OverlayStyle, OverlayTheme, decode_tmux_color},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JumpOptions {
-    pub label_keys: Vec<char>,
+    pub label_keys: LabelKeys,
     pub match_mode: MatchMode,
     pub case_sensitive: bool,
     pub auto_jump: bool,
@@ -38,8 +38,8 @@ impl JumpConfig {
             label_keys: values
                 .label_keys
                 .as_deref()
-                .map(label_keys_from_env)
-                .unwrap_or_else(|| DEFAULT_LABEL_KEYS.to_vec()),
+                .map(LabelKeys::from_env)
+                .unwrap_or_default(),
             match_mode: MatchMode::from_env(values.match_mode.as_deref().unwrap_or("word")),
             case_sensitive: option_enabled(values.case_sensitive.as_deref().unwrap_or_default()),
             auto_jump: !option_disabled(values.auto_jump.as_deref().unwrap_or_default()),
@@ -113,7 +113,7 @@ mod tests {
             key_position: Some(String::from("right")),
         });
 
-        assert_eq!(config.options.label_keys, vec!['a', 'b', 'c']);
+        assert_eq!(config.options.label_keys.as_slice(), ['a', 'b', 'c']);
         assert_eq!(config.options.match_mode, MatchMode::Char);
         assert!(config.options.case_sensitive);
         assert!(!config.options.auto_jump);

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use crate::{
     config::JumpConfig,
-    jump::{bounded_subset_bounds, jump_position_for_char_index, labels_for, positions_for},
+    jump::{bounded_subset_bounds, jump_target_for_char_index, labels_for, positions_for},
     overlay::{draw_overlay, with_recovered_screen},
     tmux::{PaneState, TmuxBackend},
 };
@@ -82,7 +82,7 @@ pub fn run_jump_report<B: TmuxBackend>(backend: &B, request: JumpRequest) -> Res
     }
     if request.config.options.auto_jump && positions.len() == 1 {
         machine.enter(JumpState::JumpToTarget);
-        backend.jump_to_position(&pane, jump_position_for_char_index(&screen, positions[0]))?;
+        backend.jump_to_position(&pane, jump_target_for_char_index(&screen, positions[0]))?;
         return Ok(machine.finish(JumpState::Done));
     }
 
@@ -100,7 +100,7 @@ pub fn run_jump_report<B: TmuxBackend>(backend: &B, request: JumpRequest) -> Res
         .get(selected_index)
         .copied()
         .context("selected index out of bounds")?;
-    backend.jump_to_position(&pane, jump_position_for_char_index(&screen, target))?;
+    backend.jump_to_position(&pane, jump_target_for_char_index(&screen, target))?;
     Ok(machine.finish(JumpState::Done))
 }
 
@@ -136,6 +136,7 @@ pub fn select_position_index<B: TmuxBackend>(
     let Some(key_index) = config
         .options
         .label_keys
+        .as_slice()
         .iter()
         .position(|key| *key == input)
     else {
@@ -178,7 +179,7 @@ mod tests {
     use super::{JumpRequest, JumpState, run_jump_report};
     use crate::{
         config::{EnvValues, JumpConfig},
-        jump::DisplayPosition,
+        jump::JumpTarget,
         tmux::{PaneState, TmuxBackend},
     };
 
@@ -188,7 +189,7 @@ mod tests {
         prompts_seen: RefCell<Vec<String>>,
         prompts: RefCell<VecDeque<Option<char>>>,
         writes: RefCell<Vec<String>>,
-        jumped_to: RefCell<Option<DisplayPosition>>,
+        jumped_to: RefCell<Option<JumpTarget>>,
         messages: RefCell<Vec<String>>,
     }
 
@@ -266,7 +267,7 @@ mod tests {
             Ok(())
         }
 
-        fn jump_to_position(&self, _pane: &PaneState, jump_to: DisplayPosition) -> Result<()> {
+        fn jump_to_position(&self, _pane: &PaneState, jump_to: JumpTarget) -> Result<()> {
             *self.jumped_to.borrow_mut() = Some(jump_to);
             Ok(())
         }
@@ -298,7 +299,7 @@ mod tests {
         );
         assert_eq!(
             *backend.jumped_to.borrow(),
-            Some(DisplayPosition { row: 0, column: 5 })
+            Some(JumpTarget { row: 0, column: 5 })
         );
         assert_eq!(backend.writes.borrow().len(), 3);
         assert_eq!(
@@ -360,7 +361,7 @@ mod tests {
         );
         assert_eq!(
             *backend.jumped_to.borrow(),
-            Some(DisplayPosition { row: 0, column: 0 })
+            Some(JumpTarget { row: 0, column: 0 })
         );
         assert!(backend.writes.borrow().is_empty());
         assert!(backend.messages.borrow().is_empty());
@@ -393,7 +394,7 @@ mod tests {
         );
         assert_eq!(
             *backend.jumped_to.borrow(),
-            Some(DisplayPosition { row: 0, column: 1 })
+            Some(JumpTarget { row: 0, column: 1 })
         );
         assert!(backend.writes.borrow().is_empty());
         assert!(backend.messages.borrow().is_empty());
@@ -419,7 +420,7 @@ mod tests {
         assert_eq!(report.state, JumpState::Done);
         assert_eq!(
             *backend.jumped_to.borrow(),
-            Some(DisplayPosition { row: 0, column: 4 })
+            Some(JumpTarget { row: 0, column: 4 })
         );
         assert!(backend.writes.borrow().is_empty());
         assert!(backend.messages.borrow().is_empty());
@@ -454,7 +455,7 @@ mod tests {
         // Slashes sit at indices 1 and 3; label 'f' is the second label key.
         assert_eq!(
             *backend.jumped_to.borrow(),
-            Some(DisplayPosition { row: 0, column: 3 })
+            Some(JumpTarget { row: 0, column: 3 })
         );
         assert!(!backend.writes.borrow().is_empty());
         assert!(backend.messages.borrow().is_empty());

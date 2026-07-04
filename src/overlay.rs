@@ -2,7 +2,7 @@ use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    jump::{KeyPosition, display_position_for_char_index},
+    jump::{KeyPosition, overlay_anchor_for_char_index},
     tmux::{PaneState, TmuxBackend},
 };
 
@@ -166,7 +166,7 @@ fn render_overlay(
     rendered.push_str(&screen.replace('\n', "\n\r"));
 
     for (position, label) in positions.iter().zip(labels.iter()) {
-        let display_position = display_position_for_char_index(screen, *position);
+        let display_position = overlay_anchor_for_char_index(screen, *position);
         let label_width: usize = label
             .chars()
             .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
@@ -254,6 +254,22 @@ mod tests {
         assert!(left.contains("\u{1b}[1;3HFGLBjk\u{1b}[0m"));
         assert!(off_left.contains("\u{1b}[1;1HFGLBjk\u{1b}[0m"));
         assert!(right.contains("\u{1b}[1;4HFGLBjk\u{1b}[0m"));
+    }
+
+    #[test]
+    fn render_overlay_off_left_saturates_at_the_first_column() {
+        // A target in column 0 with a two-char label must not underflow: the
+        // label clamps to column 1 (1-based) instead of wrapping around.
+        let positions = [0usize];
+        let labels = [String::from("jk")];
+        let rendered = render_overlay(
+            "alpha",
+            &positions[..],
+            &labels[..],
+            &style(KeyPosition::OffLeft),
+        );
+
+        assert!(rendered.contains("\u{1b}[1;1HFGLBjk\u{1b}[0m"));
     }
 
     #[test]

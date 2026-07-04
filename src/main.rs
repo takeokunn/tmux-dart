@@ -178,4 +178,56 @@ mod tests {
         let result = run_with_args(["help".to_owned()]);
         assert!(result.is_ok());
     }
+
+    /// Convenience for driving `run_with_args` from string slices. These cases
+    /// all fail (or return) during argument parsing, before any tmux call, so
+    /// they are deterministic without a live tmux server.
+    fn run(args: &[&str]) -> anyhow::Result<()> {
+        run_with_args(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    /// The error message for a failed run, or empty string on success. Avoids
+    /// `unwrap`/`expect`, which the crate lints deny.
+    fn error_message(args: &[&str]) -> String {
+        match run(args) {
+            Ok(()) => String::new(),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn char_and_char_file_are_mutually_exclusive() {
+        assert!(
+            error_message(&["jump", "--char", "a", "--char-file", "/tmp/x"])
+                .contains("mutually exclusive")
+        );
+    }
+
+    #[test]
+    fn unknown_argument_is_rejected() {
+        assert!(error_message(&["jump", "--nope"]).contains("unsupported argument"));
+    }
+
+    #[test]
+    fn missing_values_are_rejected() {
+        assert!(run(&["jump", "--char"]).is_err());
+        assert!(run(&["jump", "--char-file"]).is_err());
+        assert!(run(&["jump", "--pane-id"]).is_err());
+    }
+
+    #[test]
+    fn jump_without_a_character_source_is_usage_error() {
+        assert!(run(&["jump"]).is_err());
+    }
+
+    #[test]
+    fn unknown_subcommand_is_rejected() {
+        assert!(run(&["frobnicate"]).is_err());
+        assert!(run(&[]).is_err());
+    }
+
+    #[test]
+    fn multi_character_char_value_is_rejected() {
+        assert!(run(&["jump", "--char", "ab"]).is_err());
+    }
 }

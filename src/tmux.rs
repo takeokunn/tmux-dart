@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use tempfile::NamedTempFile;
 
-use crate::jump::DisplayPosition;
+use crate::jump::JumpTarget;
 
 #[derive(Debug, Clone)]
 pub struct PaneState {
@@ -32,7 +32,7 @@ pub trait TmuxBackend {
     fn write_to_tty(&self, pane: &PaneState, content: &str) -> Result<()>;
     fn prompt_for_label_char(&self, prompt: &str) -> Result<Option<char>>;
     fn display_message(&self, message: &str) -> Result<()>;
-    fn jump_to_position(&self, pane: &PaneState, jump_to: DisplayPosition) -> Result<()>;
+    fn jump_to_position(&self, pane: &PaneState, jump_to: JumpTarget) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -71,7 +71,7 @@ impl TmuxBackend for RealTmux {
         display_message(message)
     }
 
-    fn jump_to_position(&self, pane: &PaneState, jump_to: DisplayPosition) -> Result<()> {
+    fn jump_to_position(&self, pane: &PaneState, jump_to: JumpTarget) -> Result<()> {
         jump_to_position(pane, jump_to)
     }
 }
@@ -224,7 +224,7 @@ fn strip_optional_line_ending(content: &str) -> &str {
     }
 }
 
-pub fn jump_to_position(pane: &PaneState, jump_to: DisplayPosition) -> Result<()> {
+pub fn jump_to_position(pane: &PaneState, jump_to: JumpTarget) -> Result<()> {
     for command in copy_mode_jump_commands(pane, jump_to) {
         send_copy_mode_jump_command(pane, command)?;
     }
@@ -242,7 +242,7 @@ enum CopyModeJumpCommand {
     CursorRight(usize),
 }
 
-fn copy_mode_jump_commands(pane: &PaneState, jump_to: DisplayPosition) -> Vec<CopyModeJumpCommand> {
+fn copy_mode_jump_commands(pane: &PaneState, jump_to: JumpTarget) -> Vec<CopyModeJumpCommand> {
     let mut commands = vec![
         CopyModeJumpCommand::CopyMode,
         CopyModeJumpCommand::StartOfLine,
@@ -379,7 +379,7 @@ mod tests {
         prompt_for_label_char_command, shell_quote, trim_single_trailing_newline,
     };
 
-    use crate::jump::DisplayPosition;
+    use crate::jump::JumpTarget;
 
     #[test]
     fn capture_output_only_trims_tmuxs_final_newline() {
@@ -437,7 +437,7 @@ mod tests {
         let pane = pane_with_scroll_position(3);
 
         assert_eq!(
-            copy_mode_jump_commands(&pane, DisplayPosition { row: 2, column: 5 }),
+            copy_mode_jump_commands(&pane, JumpTarget { row: 2, column: 5 }),
             vec![
                 CopyModeJumpCommand::CopyMode,
                 CopyModeJumpCommand::StartOfLine,
@@ -454,7 +454,7 @@ mod tests {
         let pane = pane_with_scroll_position(0);
 
         assert_eq!(
-            copy_mode_jump_commands(&pane, DisplayPosition { row: 0, column: 0 }),
+            copy_mode_jump_commands(&pane, JumpTarget { row: 0, column: 0 }),
             vec![
                 CopyModeJumpCommand::CopyMode,
                 CopyModeJumpCommand::StartOfLine,
