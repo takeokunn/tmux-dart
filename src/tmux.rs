@@ -21,6 +21,13 @@ pub struct PaneState {
     pub alternate_on: bool,
     pub scroll_position: usize,
     pub pane_height: usize,
+    /// History size when this snapshot was taken. A pane that keeps producing
+    /// output (`tail -f`, a busy TUI on the normal screen) pushes the captured
+    /// region one line further into history per new line; comparing this
+    /// against the current history size re-anchors captures and jumps to the
+    /// content the user actually saw. On the alternate screen history stays 0,
+    /// so the compensation is a no-op there.
+    pub history_size: usize,
 }
 
 pub trait TmuxBackend {
@@ -85,10 +92,10 @@ pub fn display_message(message: &str) -> Result<()> {
 }
 
 pub fn pane_state(pane_id: &str) -> Result<PaneState> {
-    let format = "#{pane_id};#{pane_tty};#{pane_in_mode};#{cursor_y};#{cursor_x};#{alternate_on};#{scroll_position};#{pane_height}";
+    let format = "#{pane_id};#{pane_tty};#{pane_in_mode};#{cursor_y};#{cursor_x};#{alternate_on};#{scroll_position};#{pane_height};#{history_size}";
     let output = tmux_output(["display-message", "-p", "-t", pane_id, "-F", format])?;
     let parts: Vec<&str> = output.split(';').collect();
-    if parts.len() != 8 {
+    if parts.len() != 9 {
         bail!("unexpected tmux pane format output: {output}");
     }
 
@@ -101,7 +108,29 @@ pub fn pane_state(pane_id: &str) -> Result<PaneState> {
         alternate_on: parts[5] == "1",
         scroll_position: parse_usize_or_zero(parts[6], "scroll_position")?,
         pane_height: parse_usize_or_zero(parts[7], "pane_height")?,
+        history_size: parse_usize_or_zero(parts[8], "history_size")?,
     })
+}
+
+fn pane_history_size(pane_id: &str) -> Result<usize> {
+    let output = tmux_output([
+        "display-message",
+        "-p",
+        "-t",
+        pane_id,
+        "-F",
+        "#{history_size}",
+    ])?;
+    parse_usize_or_zero(&output, "history_size")
+}
+
+/// Lines above the *current* visible top where the region snapshotted in
+/// `pane` now sits. Output that arrived since the snapshot pushed that region
+/// deeper into history, one line per new history line; without this the
+/// capture and the jump would both land `delta` rows below the content the
+/// user saw. Saturating: `clear-history` during selection cannot underflow.
+fn rebased_scroll_position(pane: &PaneState, history_size_now: usize) -> usize {
+    pane.scroll_position + history_size_now.saturating_sub(pane.history_size)
 }
 
 fn parse_usize_or_zero(value: &str, field: &str) -> Result<usize> {
@@ -113,7 +142,8 @@ fn parse_usize_or_zero(value: &str, field: &str) -> Result<usize> {
 }
 
 pub fn capture_visible_pane(pane: &PaneState) -> Result<String> {
-    let start = -(pane.scroll_position as isize);
+    let scroll = rebased_scroll_position(pane, pane_history_size(&pane.pane_id)?);
+    let start = -(scroll as isize);
     let end = start + pane.pane_height as isize - 1;
     tmux_capture_output([
         "capture-pane",
@@ -225,7 +255,11 @@ fn strip_optional_line_ending(content: &str) -> &str {
 }
 
 pub fn jump_to_position(pane: &PaneState, jump_to: JumpTarget) -> Result<()> {
-    for command in copy_mode_jump_commands(pane, jump_to) {
+    // Enter copy mode first: it pins the view, so the scroll compensation read
+    // right after stays valid even while the pane keeps producing output.
+    tmux_success(["copy-mode", "-t", &pane.pane_id])?;
+    let scroll_up = rebased_scroll_position(pane, pane_history_size(&pane.pane_id)?);
+    for command in copy_mode_movement_commands(scroll_up, jump_to) {
         send_copy_mode_jump_command(pane, command)?;
     }
 
@@ -234,7 +268,6 @@ pub fn jump_to_position(pane: &PaneState, jump_to: JumpTarget) -> Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyModeJumpCommand {
-    CopyMode,
     StartOfLine,
     TopLine,
     CursorUp(usize),
@@ -242,15 +275,17 @@ enum CopyModeJumpCommand {
     CursorRight(usize),
 }
 
-fn copy_mode_jump_commands(pane: &PaneState, jump_to: JumpTarget) -> Vec<CopyModeJumpCommand> {
+/// Movements to run after copy mode is entered. `scroll_up` is the (already
+/// history-compensated) number of rows between the current visible top and the
+/// top of the captured region.
+fn copy_mode_movement_commands(scroll_up: usize, jump_to: JumpTarget) -> Vec<CopyModeJumpCommand> {
     let mut commands = vec![
-        CopyModeJumpCommand::CopyMode,
         CopyModeJumpCommand::StartOfLine,
         CopyModeJumpCommand::TopLine,
     ];
 
-    if pane.scroll_position > 0 {
-        commands.push(CopyModeJumpCommand::CursorUp(pane.scroll_position));
+    if scroll_up > 0 {
+        commands.push(CopyModeJumpCommand::CursorUp(scroll_up));
     }
     if jump_to.row > 0 {
         commands.push(CopyModeJumpCommand::CursorDown(jump_to.row));
@@ -264,7 +299,6 @@ fn copy_mode_jump_commands(pane: &PaneState, jump_to: JumpTarget) -> Vec<CopyMod
 
 fn send_copy_mode_jump_command(pane: &PaneState, command: CopyModeJumpCommand) -> Result<()> {
     match command {
-        CopyModeJumpCommand::CopyMode => tmux_success(["copy-mode", "-t", &pane.pane_id]),
         CopyModeJumpCommand::StartOfLine => {
             tmux_success(["send-keys", "-X", "-t", &pane.pane_id, "start-of-line"])
         }
@@ -375,8 +409,9 @@ fn prompt_for_label_char_command(quoted_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CopyModeJumpCommand, copy_mode_jump_commands, parse_single_char_content,
-        prompt_for_label_char_command, shell_quote, trim_single_trailing_newline,
+        CopyModeJumpCommand, copy_mode_movement_commands, parse_single_char_content,
+        prompt_for_label_char_command, rebased_scroll_position, shell_quote,
+        trim_single_trailing_newline,
     };
 
     use crate::jump::JumpTarget;
@@ -433,13 +468,10 @@ mod tests {
     }
 
     #[test]
-    fn copy_mode_jump_commands_use_display_rows_and_columns() {
-        let pane = pane_with_scroll_position(3);
-
+    fn copy_mode_movements_use_scroll_rows_and_columns() {
         assert_eq!(
-            copy_mode_jump_commands(&pane, JumpTarget { row: 2, column: 5 }),
+            copy_mode_movement_commands(3, JumpTarget { row: 2, column: 5 }),
             vec![
-                CopyModeJumpCommand::CopyMode,
                 CopyModeJumpCommand::StartOfLine,
                 CopyModeJumpCommand::TopLine,
                 CopyModeJumpCommand::CursorUp(3),
@@ -450,20 +482,32 @@ mod tests {
     }
 
     #[test]
-    fn copy_mode_jump_commands_omit_zero_distance_moves() {
-        let pane = pane_with_scroll_position(0);
-
+    fn copy_mode_movements_omit_zero_distance_moves() {
         assert_eq!(
-            copy_mode_jump_commands(&pane, JumpTarget { row: 0, column: 0 }),
+            copy_mode_movement_commands(0, JumpTarget { row: 0, column: 0 }),
             vec![
-                CopyModeJumpCommand::CopyMode,
                 CopyModeJumpCommand::StartOfLine,
                 CopyModeJumpCommand::TopLine,
             ]
         );
     }
 
-    fn pane_with_scroll_position(scroll_position: usize) -> super::PaneState {
+    #[test]
+    fn rebased_scroll_position_follows_new_output_into_history() {
+        let pane = pane_with_scroll_and_history(4, 100);
+        // No new output: the original scroll offset still holds.
+        assert_eq!(rebased_scroll_position(&pane, 100), 4);
+        // Seven lines arrived while the user was picking a label: the captured
+        // region is now seven lines further up.
+        assert_eq!(rebased_scroll_position(&pane, 107), 11);
+        // History shrank (clear-history): never underflow.
+        assert_eq!(rebased_scroll_position(&pane, 0), 4);
+    }
+
+    fn pane_with_scroll_and_history(
+        scroll_position: usize,
+        history_size: usize,
+    ) -> super::PaneState {
         super::PaneState {
             pane_id: String::from("%0"),
             tty_path: String::from("/dev/null"),
@@ -473,6 +517,7 @@ mod tests {
             alternate_on: false,
             scroll_position,
             pane_height: 24,
+            history_size,
         }
     }
 }

@@ -2,7 +2,7 @@ use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    jump::{KeyPosition, overlay_anchor_for_char_index},
+    jump::{KeyPosition, display_cell_width_for_char_index, overlay_anchor_for_char_index},
     tmux::{PaneState, TmuxBackend},
 };
 
@@ -199,12 +199,10 @@ fn render_overlay(
         let start_column = match style.key_position {
             KeyPosition::Left => display_position.column,
             KeyPosition::Right => {
-                let target_width = screen
-                    .chars()
-                    .nth(*position)
-                    .and_then(UnicodeWidthChar::width)
-                    .unwrap_or(1);
-                display_position.column + target_width
+                // Whole-cell width, not the width of the char alone: for a
+                // cluster like ☝️ the wideness comes from the variation
+                // selector, and the label must clear the entire cell.
+                display_position.column + display_cell_width_for_char_index(screen, *position)
             }
             KeyPosition::OffLeft => display_position.column.saturating_sub(label_width),
         };
@@ -366,6 +364,23 @@ mod tests {
         );
 
         assert!(rendered.contains("\u{1b}[1;9HFGLBj\u{1b}[0m"));
+    }
+
+    #[test]
+    fn render_overlay_right_position_clears_multi_char_clusters() {
+        // ☝ + VS16 is one grid cell of width 2; a right-positioned label must
+        // land after the whole cell (1-based column 3), not after the base
+        // char's own width.
+        let positions = [0usize];
+        let labels = [String::from("j")];
+        let rendered = render_overlay(
+            "☝\u{fe0f} z",
+            &positions[..],
+            &labels[..],
+            &style(KeyPosition::Right),
+        );
+
+        assert!(rendered.contains("\u{1b}[1;3HFGLBj\u{1b}[0m"));
     }
 
     #[test]

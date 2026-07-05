@@ -218,15 +218,25 @@ fn assert_jump(
     Ok(())
 }
 
-/// Probe whether this environment's tmux treats CJK characters as double-width.
-/// One `cursor-right` from column 0 of "あa" lands on column 2 when wide-aware
-/// (the padding cell is skipped) and column 1 otherwise. Guards the wide-char
-/// assertions against non-UTF-8 locales.
-fn tmux_is_wide_aware() -> Result<bool> {
-    let (server, pane) = Server::start("あa", 80, 24)?;
+/// Grid column of the copy cursor after pressing `cursor-right` `presses`
+/// times from the start of `content`'s first line, on a raw tmux server with
+/// no tmux-dart involved. Probes how this environment's tmux lays `content`
+/// out in grid cells, guarding cell-layout assertions against older tmux or
+/// non-UTF-8 locales.
+fn cursor_x_after_presses(content: &str, presses: usize) -> Result<i64> {
+    let (server, pane) = Server::start(content, 80, 24)?;
     server.tmux(&["copy-mode", "-t", &pane])?;
     server.tmux(&["send-keys", "-X", "-t", &pane, "start-of-line"])?;
-    server.tmux(&["send-keys", "-X", "-t", &pane, "cursor-right"])?;
+    server.tmux(&["send-keys", "-X", "-t", &pane, "top-line"])?;
+    server.tmux(&[
+        "send-keys",
+        "-X",
+        "-t",
+        &pane,
+        "-N",
+        &presses.to_string(),
+        "cursor-right",
+    ])?;
     let x = server.tmux(&[
         "display-message",
         "-p",
@@ -235,7 +245,14 @@ fn tmux_is_wide_aware() -> Result<bool> {
         "-F",
         "#{copy_cursor_x}",
     ])?;
-    Ok(parse_i64(&x)? == 2)
+    parse_i64(&x)
+}
+
+/// Probe whether this environment's tmux treats CJK characters as double-width.
+/// One `cursor-right` from column 0 of "あa" lands on column 2 when wide-aware
+/// (the padding cell is skipped) and column 1 otherwise.
+fn tmux_is_wide_aware() -> Result<bool> {
+    Ok(cursor_x_after_presses("あa", 1)? == 2)
 }
 
 macro_rules! require_tmux {
@@ -329,6 +346,108 @@ fn jumps_to_the_correct_cell_after_wide_characters() -> Result<()> {
     assert_jump("あいう z", 80, 24, "z", "word", (7, 0))?;
     // Same, one row down and with a shorter wide run: grid column 5, row 1.
     assert_jump("top\\nかき z", 80, 24, "z", "word", (5, 1))
+}
+
+#[test]
+fn jumps_to_the_correct_cell_after_combining_marks() -> Result<()> {
+    require_tmux!();
+    // macOS `ls` emits NFD: each か+゙ pair shares one grid cell, so 'z' is
+    // three presses away on grid column 5. Counting the combining marks as
+    // presses would run past the line end and wrap onto the next row.
+    if cursor_x_after_presses("か\u{3099}き\u{3099} z", 3)? != 5 {
+        eprintln!("skipping NFD e2e: tmux does not combine NFD marks in this environment");
+        return Ok(());
+    }
+    assert_jump("か\u{3099}き\u{3099} z", 80, 24, "z", "word", (5, 0))
+}
+
+#[test]
+fn jumps_to_the_correct_cell_after_emoji_clusters() -> Result<()> {
+    require_tmux!();
+    // Each cluster is one grid cell of width 2 in modern tmux: 'z' is two
+    // presses away on grid column 3. The raw-tmux probe skips a case when this
+    // environment's tmux does not combine that cluster kind.
+    let cases = [
+        ("👨\u{200d}👩\u{200d}👧 z", "ZWJ family emoji"),
+        ("☝\u{fe0f} z", "VS16 emoji presentation"),
+        ("🇯🇵 z", "regional indicator pair"),
+        ("👍🏻 z", "skin-tone modifier"),
+    ];
+    for (content, kind) in cases {
+        if cursor_x_after_presses(content, 2)? != 3 {
+            eprintln!("skipping {kind} e2e: tmux does not combine it into one cell here");
+            continue;
+        }
+        assert_jump(content, 80, 24, "z", "word", (3, 0))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn jumps_on_the_alternate_screen() -> Result<()> {
+    require_tmux!();
+    // A TUI-style pane: rows painted on the alternate screen, where there is
+    // no history and no scroll offset.
+    let content = "\\033[?1049h\\033[Halpha beta\\r\\ngamma zebra";
+    let (server, pane) = Server::start(content, 80, 24)?;
+    assert_eq!(
+        server.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            &pane,
+            "-F",
+            "#{alternate_on}"
+        ])?,
+        "1",
+        "the fixture must be on the alternate screen"
+    );
+
+    server.run_jump(&pane, "z", "word")?;
+    assert!(server.in_copy_mode(&pane)?);
+    assert_eq!(server.copy_cursor(&pane)?, (6, 1));
+    Ok(())
+}
+
+#[test]
+fn jumps_within_scrolled_history() -> Result<()> {
+    require_tmux!();
+    // The user scrolled 15 lines up in copy mode before triggering the jump:
+    // the flow must capture the *scrolled* view, and the jump must land there
+    // (cursor-up over the scroll offset), not on the bottom of history.
+    let mut lines: Vec<String> = (1..=40)
+        .map(|i| {
+            if i == 20 {
+                String::from("Qmarker")
+            } else {
+                format!("line {i:02}")
+            }
+        })
+        .collect();
+    lines.push(String::from("bottom"));
+    let content = lines.join("\\n");
+
+    let (server, pane) = Server::start(&content, 80, 10)?;
+    server.tmux(&["copy-mode", "-t", &pane])?;
+    server.tmux(&["send-keys", "-X", "-t", &pane, "-N", "15", "scroll-up"])?;
+
+    server.run_jump(&pane, "Q", "word")?;
+    assert!(server.in_copy_mode(&pane)?);
+    // "Qmarker" (history line 20) is the 4th visible row of the scrolled view.
+    assert_eq!(server.copy_cursor(&pane)?, (0, 3));
+    assert_eq!(
+        server.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            &pane,
+            "-F",
+            "#{scroll_position}"
+        ])?,
+        "15",
+        "the jump must stay within the view the user had scrolled to"
+    );
+    Ok(())
 }
 
 #[test]

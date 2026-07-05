@@ -237,6 +237,7 @@ mod tests {
                 alternate_on: false,
                 scroll_position: 0,
                 pane_height: 24,
+                history_size: 0,
             })
         }
 
@@ -424,6 +425,29 @@ mod tests {
         );
         assert!(backend.writes.borrow().is_empty());
         assert!(backend.messages.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn jump_flow_counts_grid_cells_for_combining_marks() -> Result<()> {
+        // macOS emits NFD text: "がぎ" arrives as か+゙ き+゙. Each pair shares
+        // one grid cell, so 'z' is 3 cursor-right presses away, not 5 —
+        // counting chars would run past the line end and wrap to the next row.
+        let backend = FakeBackend::default().with_screen("か\u{3099}き\u{3099} z");
+        let report = run_jump_report(
+            &backend,
+            JumpRequest {
+                initial_char: 'z',
+                pane_id: None,
+                config: JumpConfig::from_values(EnvValues::default()),
+            },
+        )?;
+
+        assert_eq!(report.state, JumpState::Done);
+        assert_eq!(
+            *backend.jumped_to.borrow(),
+            Some(JumpTarget { row: 0, column: 3 })
+        );
         Ok(())
     }
 
