@@ -1,4 +1,5 @@
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const DEFAULT_LABEL_KEYS: [char; 9] = ['j', 'f', 'h', 'g', 'k', 'd', 'l', 's', 'a'];
 
@@ -37,8 +38,8 @@ impl KeyPosition {
 }
 
 /// Anchor for drawing an overlay label. `column` is a **display** column: each
-/// character contributes its terminal width, so a wide (East Asian) character
-/// counts as two. This matches the ANSI absolute cursor positioning
+/// grid cell contributes its terminal width, so a wide (East Asian or emoji)
+/// cell counts as two. This matches the ANSI absolute cursor positioning
 /// (`ESC[row;colH`) the overlay uses.
 ///
 /// Deliberately a distinct type from [`JumpTarget`]: the two carry different
@@ -50,11 +51,14 @@ pub struct OverlayAnchor {
     pub column: usize,
 }
 
-/// Target for driving copy-mode navigation. `column` is a **character** count
-/// from the start of the row. tmux's `cursor-right` skips the padding cell of a
-/// wide character, so one press moves exactly one logical character regardless
-/// of display width; counting display cells would overshoot on any line
-/// containing wide characters.
+/// Target for driving copy-mode navigation. `column` is a **grid-cell** count
+/// from the start of the row: one copy-mode `cursor-right` press moves exactly
+/// one cell. tmux stores a whole grapheme cluster — a base character plus its
+/// combining marks, ZWJ emoji sequences, variation selectors, flag (regional
+/// indicator) pairs, and skin-tone modifiers — in a single cell, and a press
+/// also skips the padding cell of a wide character. Counting chars would
+/// overshoot on NFD text (macOS emits "ぎ" as き + ゙) and on emoji clusters;
+/// counting display cells would overshoot on any wide character.
 ///
 /// Deliberately a distinct type from [`OverlayAnchor`] — see its docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,50 +68,104 @@ pub struct JumpTarget {
 }
 
 fn is_word_char(ch: char) -> bool {
-    ch == '_' || ch.is_alphanumeric()
+    // Zero-width characters (combining marks, ZWJ, variation selectors) share
+    // their base character's cell, so they continue a word rather than break
+    // it. Without this, NFD text — e.g. "ぎ" captured as き + ゙ — would surface
+    // a bogus word start after every combining mark.
+    ch == '_' || ch.is_alphanumeric() || UnicodeWidthChar::width(ch) == Some(0)
 }
 
 /// Locate the character at `target_index` for overlay label placement. See
 /// [`OverlayAnchor`] for why the column is measured in display cells.
 pub fn overlay_anchor_for_char_index(screen: &str, target_index: usize) -> OverlayAnchor {
-    let (row, column) = row_and_column(screen, target_index, ColumnMetric::DisplayWidth);
-    OverlayAnchor { row, column }
+    let cell = cell_position_for_char_index(screen, target_index);
+    OverlayAnchor {
+        row: cell.row,
+        column: cell.display_column,
+    }
 }
 
 /// Locate the character at `target_index` for copy-mode navigation. See
-/// [`JumpTarget`] for why the column is measured in characters.
+/// [`JumpTarget`] for why the column is measured in grid cells.
 pub fn jump_target_for_char_index(screen: &str, target_index: usize) -> JumpTarget {
-    let (row, column) = row_and_column(screen, target_index, ColumnMetric::CharCount);
-    JumpTarget { row, column }
+    let cell = cell_position_for_char_index(screen, target_index);
+    JumpTarget {
+        row: cell.row,
+        column: cell.cell_column,
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColumnMetric {
-    DisplayWidth,
-    CharCount,
+/// Display width (always at least 1) of the grid cell holding the character at
+/// `target_index`. Lets the overlay place a label immediately to the right of
+/// its target even when the target is a multi-char cluster such as ☝️, whose
+/// width comes from the variation selector, not the base character alone.
+pub fn display_cell_width_for_char_index(screen: &str, target_index: usize) -> usize {
+    cell_position_for_char_index(screen, target_index).cell_width
 }
 
-fn row_and_column(screen: &str, target_index: usize, metric: ColumnMetric) -> (usize, usize) {
+/// Position of the grid cell that holds the character at a given char index.
+///
+/// tmux keeps an entire grapheme cluster in one cell (verified against tmux
+/// 3.6a for combining marks, ZWJ sequences, variation selectors, flag pairs,
+/// and skin-tone modifiers), so both column metrics walk clusters, not chars.
+/// `unicode_width`'s **str** width mirrors that cell's display width (e.g.
+/// ☝ + VS16 → 2), which the per-char width cannot express.
+struct CellPosition {
+    row: usize,
+    /// Display column where the cell starts (sum of preceding cell widths).
+    display_column: usize,
+    /// Cell index within the row: one `cursor-right` press per cell.
+    cell_column: usize,
+    /// Display width of the cell itself, at least 1.
+    cell_width: usize,
+}
+
+fn cell_position_for_char_index(screen: &str, target_index: usize) -> CellPosition {
     let mut row = 0usize;
-    let mut column = 0usize;
+    let mut display_column = 0usize;
+    let mut cell_column = 0usize;
+    let mut char_index = 0usize;
 
-    for (index, ch) in screen.chars().enumerate() {
-        if index == target_index {
-            return (row, column);
-        }
+    for cluster in screen.graphemes(true) {
+        let char_count = cluster.chars().count();
+        let cluster_holds_target = target_index < char_index + char_count;
 
-        if ch == '\n' {
+        if cluster == "\n" {
+            // A newline "sits" at the end of its row; fall through to the
+            // final return without advancing to the next row.
+            if cluster_holds_target {
+                break;
+            }
             row += 1;
-            column = 0;
+            display_column = 0;
+            cell_column = 0;
         } else {
-            column += match metric {
-                ColumnMetric::DisplayWidth => UnicodeWidthChar::width(ch).unwrap_or(0),
-                ColumnMetric::CharCount => 1,
-            };
+            let width = UnicodeWidthStr::width(cluster);
+            if cluster_holds_target {
+                return CellPosition {
+                    row,
+                    display_column,
+                    cell_column,
+                    cell_width: width.max(1),
+                };
+            }
+            // A width-0 cluster is an orphan combining mark with no base
+            // character; tmux drops it from the grid, so it occupies no cell.
+            if width > 0 {
+                display_column += width;
+                cell_column += 1;
+            }
         }
+
+        char_index += char_count;
     }
 
-    (row, column)
+    CellPosition {
+        row,
+        display_column,
+        cell_column,
+        cell_width: 1,
+    }
 }
 
 pub fn positions_of(target: char, screen: &str) -> Vec<usize> {
@@ -305,8 +363,8 @@ mod tests {
         labels_for, positions_for, positions_of, subset_bounds,
     };
     use crate::jump::{
-        JumpTarget, KeyPosition, OverlayAnchor, jump_target_for_char_index,
-        overlay_anchor_for_char_index,
+        JumpTarget, KeyPosition, OverlayAnchor, display_cell_width_for_char_index,
+        jump_target_for_char_index, overlay_anchor_for_char_index,
     };
 
     #[test]
@@ -375,10 +433,10 @@ mod tests {
     }
 
     #[test]
-    fn jump_target_counts_characters_not_display_width() {
+    fn jump_target_counts_grid_cells_not_chars_or_display_width() {
         // Copy-mode `cursor-right` skips a wide character's padding cell, so the
-        // jump must count one column per logical character. The overlay, by
-        // contrast, needs display cells. Both must agree on the row.
+        // jump must count one column per grid cell. The overlay, by contrast,
+        // needs display cells. Both must agree on the row.
         let screen = "あいう z\nab";
         assert_eq!(
             jump_target_for_char_index(screen, 4),
@@ -393,6 +451,80 @@ mod tests {
             jump_target_for_char_index(screen, 6),
             JumpTarget { row: 1, column: 0 }
         );
+    }
+
+    #[test]
+    fn clusters_count_one_cell_for_jump_and_full_width_for_overlay() {
+        // tmux stores each of these clusters in a single grid cell (verified
+        // against tmux 3.6a): one cursor-right press each, with the display
+        // width of the whole cluster. Counting chars or per-char widths would
+        // overshoot past the line end and wrap onto the next row.
+        let cases = [
+            ("か\u{3099}き\u{3099} z", 3, 5, "NFD combining marks"),
+            ("👨\u{200d}👩\u{200d}👧 z", 2, 3, "ZWJ family emoji"),
+            ("☝\u{fe0f} z", 2, 3, "VS16 emoji presentation"),
+            ("🇯🇵 z", 2, 3, "regional indicator pair"),
+            ("👍🏻 z", 2, 3, "skin-tone modifier"),
+        ];
+        for (screen, cell_column, display_column, kind) in cases {
+            let z_index = screen.chars().count() - 1;
+            assert_eq!(
+                jump_target_for_char_index(screen, z_index),
+                JumpTarget {
+                    row: 0,
+                    column: cell_column
+                },
+                "jump column for {kind}"
+            );
+            assert_eq!(
+                overlay_anchor_for_char_index(screen, z_index),
+                OverlayAnchor {
+                    row: 0,
+                    column: display_column
+                },
+                "overlay column for {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn mid_cluster_index_resolves_to_the_cell_start() {
+        // Index 2 is 👩, inside the family cluster: both metrics must anchor to
+        // the cell the char lives in, never to a position inside it.
+        let screen = "👨\u{200d}👩\u{200d}👧 z";
+        assert_eq!(
+            jump_target_for_char_index(screen, 2),
+            JumpTarget { row: 0, column: 0 }
+        );
+        assert_eq!(
+            overlay_anchor_for_char_index(screen, 2),
+            OverlayAnchor { row: 0, column: 0 }
+        );
+    }
+
+    #[test]
+    fn display_cell_width_covers_the_whole_cluster() {
+        assert_eq!(display_cell_width_for_char_index("a b", 0), 1);
+        assert_eq!(display_cell_width_for_char_index("あ b", 0), 2);
+        // The width-2 comes from the variation selector, not the base char.
+        assert_eq!(display_cell_width_for_char_index("☝\u{fe0f} b", 0), 2);
+        assert_eq!(
+            display_cell_width_for_char_index("👨\u{200d}👩\u{200d}👧 b", 0),
+            2
+        );
+        assert_eq!(display_cell_width_for_char_index("か\u{3099} b", 0), 2);
+    }
+
+    #[test]
+    fn word_mode_treats_combining_marks_as_word_continuation() {
+        // NFD "がぎ": き follows a combining mark but is mid-word, so it must
+        // not surface as a word start; the word still starts at か.
+        let screen = "か\u{3099}き\u{3099} zebra";
+        assert_eq!(
+            positions_for('き', screen, MatchMode::Word, false),
+            Vec::<usize>::new()
+        );
+        assert_eq!(positions_for('か', screen, MatchMode::Word, false), vec![0]);
     }
 
     #[test]
