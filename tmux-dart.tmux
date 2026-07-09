@@ -82,7 +82,7 @@ install_key_binding() {
   jump_key="$(get_tmux_option "@jump-key" "j")"
   printf -v quoted_script '%q' "$CURRENT_DIR/tmux-dart.tmux"
   tmux bind-key -N "Jump to pane location in copy mode" "$jump_key" \
-    command-prompt -1 -p 'jump char:' "run-shell -b \"$quoted_script --char '%%%'\""
+    command-prompt -p 'jump label:' "run-shell -b \"$quoted_script --char #{q:%%%}\""
 }
 
 case "${1:-}" in

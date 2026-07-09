@@ -37,7 +37,7 @@ pub trait TmuxBackend {
     fn capture_visible_pane(&self, pane: &PaneState) -> Result<String>;
     fn capture_pane_with_escapes(&self, pane_id: &str) -> Result<String>;
     fn write_to_tty(&self, pane: &PaneState, content: &str) -> Result<()>;
-    fn prompt_for_label_char(&self, prompt: &str) -> Result<Option<char>>;
+    fn prompt_for_label_input(&self, prompt: &str) -> Result<Option<String>>;
     fn display_message(&self, message: &str) -> Result<()>;
     fn jump_to_position(&self, pane: &PaneState, jump_to: JumpTarget) -> Result<()>;
 }
@@ -70,8 +70,8 @@ impl TmuxBackend for RealTmux {
         write_to_tty(&pane.tty_path, content)
     }
 
-    fn prompt_for_label_char(&self, prompt: &str) -> Result<Option<char>> {
-        prompt_for_label_char(prompt)
+    fn prompt_for_label_input(&self, prompt: &str) -> Result<Option<String>> {
+        prompt_for_label_input(prompt)
     }
 
     fn display_message(&self, message: &str) -> Result<()> {
@@ -173,23 +173,6 @@ pub fn read_initial_char_from_file(path: &str) -> Result<Option<char>> {
     wait_for_char_file(path, None, Duration::from_secs(10))
 }
 
-pub fn prompt_for_label_char(prompt: &str) -> Result<Option<char>> {
-    let temp = NamedTempFile::new().context("failed to create temporary prompt file")?;
-    let path = temp.path().to_string_lossy().into_owned();
-    let quoted_path = shell_quote(&path);
-
-    tmux_success([
-        "command-prompt",
-        "-1",
-        "-p",
-        prompt,
-        &prompt_for_label_char_command(&quoted_path),
-    ])?;
-    let previous_activity = session_activity()?;
-
-    wait_for_char_file(&path, Some(&previous_activity), Duration::from_secs(10))
-}
-
 fn wait_for_char_file(
     path: &str,
     previous_activity: Option<&str>,
@@ -242,6 +225,68 @@ fn parse_single_char_content(content: &str) -> Result<Option<char>> {
         "prompt file must contain exactly one character"
     );
     Ok(Some(first))
+}
+
+pub fn prompt_for_label_input(prompt: &str) -> Result<Option<String>> {
+    let temp = NamedTempFile::new().context("failed to create temporary prompt file")?;
+    let path = temp.path().to_string_lossy().into_owned();
+    let quoted_path = shell_quote(&path);
+
+    tmux_success([
+        "command-prompt",
+        "-p",
+        prompt,
+        &prompt_for_label_input_command(&quoted_path),
+    ])?;
+    let previous_activity = session_activity()?;
+
+    wait_for_prompt_file(&path, Some(&previous_activity), Duration::from_secs(10))
+}
+
+fn wait_for_prompt_file(
+    path: &str,
+    previous_activity: Option<&str>,
+    timeout: Duration,
+) -> Result<Option<String>> {
+    let started_at = Instant::now();
+    let deadline = started_at + timeout;
+    let activity_change_grace_period = Duration::from_millis(250);
+
+    loop {
+        if let Some(input) = read_prompt_input_from_file(path)? {
+            return Ok(Some(input));
+        }
+
+        if started_at.elapsed() >= activity_change_grace_period
+            && let Some(previous_activity) = previous_activity
+            && session_activity()? != previous_activity
+        {
+            return Ok(None);
+        }
+
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn read_prompt_input_from_file(path: &str) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(content) => parse_prompt_content(&content),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read prompt file {path}")),
+    }
+}
+
+fn parse_prompt_content(content: &str) -> Result<Option<String>> {
+    let content = strip_optional_line_ending(content);
+    if content.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(content.to_owned()))
 }
 
 fn strip_optional_line_ending(content: &str) -> &str {
@@ -402,15 +447,15 @@ fn tmux_success<const N: usize>(args: [&str; N]) -> Result<()> {
     tmux_output(args).map(|_| ())
 }
 
-fn prompt_for_label_char_command(quoted_path: &str) -> String {
-    format!(r#"run-shell "printf '%s' '%%%' > {quoted_path}""#)
+fn prompt_for_label_input_command(quoted_path: &str) -> String {
+    format!(r#"run-shell "printf '%s' #{{q:%%%}} > {quoted_path}""#)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CopyModeJumpCommand, copy_mode_movement_commands, parse_single_char_content,
-        prompt_for_label_char_command, rebased_scroll_position, shell_quote,
+        CopyModeJumpCommand, copy_mode_movement_commands, parse_prompt_content,
+        prompt_for_label_input_command, rebased_scroll_position, shell_quote,
         trim_single_trailing_newline,
     };
 
@@ -430,41 +475,31 @@ mod tests {
     }
 
     #[test]
-    fn prompt_for_label_char_command_escapes_prompt_input() {
+    fn prompt_for_label_input_command_escapes_prompt_input() {
         assert_eq!(
-            prompt_for_label_char_command("' /tmp/path '"),
-            r#"run-shell "printf '%s' '%%%' > ' /tmp/path '""#
+            prompt_for_label_input_command("' /tmp/path '"),
+            r#"run-shell "printf '%s' #{q:%%%} > ' /tmp/path '""#
         );
     }
 
     #[test]
-    fn parse_single_char_content_accepts_single_character_with_newline() {
-        assert!(matches!(parse_single_char_content("Z\n"), Ok(Some('Z'))));
+    fn parse_prompt_content_accepts_single_value_with_newline() {
+        assert!(matches!(parse_prompt_content("Z\n"), Ok(Some(value)) if value == "Z"));
     }
 
     #[test]
-    fn parse_single_char_content_accepts_single_character_with_crlf() {
-        assert!(matches!(parse_single_char_content("Z\r\n"), Ok(Some('Z'))));
+    fn parse_prompt_content_accepts_multi_character_input_with_newline() {
+        assert!(matches!(parse_prompt_content("ab\n"), Ok(Some(value)) if value == "ab"));
     }
 
     #[test]
-    fn parse_single_char_content_rejects_multiple_characters() {
-        assert!(parse_single_char_content("ab").is_err());
+    fn parse_prompt_content_returns_none_for_empty_input() {
+        assert!(matches!(parse_prompt_content(""), Ok(None)));
     }
 
     #[test]
-    fn parse_single_char_content_rejects_multiple_characters_with_newline() {
-        assert!(parse_single_char_content("ab\n").is_err());
-    }
-
-    #[test]
-    fn parse_single_char_content_rejects_extra_trailing_newlines() {
-        assert!(parse_single_char_content("Z\n\n").is_err());
-    }
-
-    #[test]
-    fn parse_single_char_content_returns_none_for_empty_input() {
-        assert!(matches!(parse_single_char_content(""), Ok(None)));
+    fn parse_prompt_content_preserves_single_character_values() {
+        assert!(matches!(parse_prompt_content("Z"), Ok(Some(value)) if value == "Z"));
     }
 
     #[test]

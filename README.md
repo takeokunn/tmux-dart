@@ -16,7 +16,7 @@
 - Supports overlay style presets for brighter, softer, and higher-contrast themes.
 - Uses word-start matching by default.
 - Uses `jfhgkdlsa` as the default label keys.
-- Supports recursive multi-key label selection when there are many matches.
+- Accepts the full label in one prompt when there are many matches.
 - Moves to the selected target with tmux copy-mode commands.
 
 ## Prerequisites

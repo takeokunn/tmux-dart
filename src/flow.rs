@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use crate::{
     config::JumpConfig,
-    jump::{bounded_subset_bounds, jump_target_for_char_index, labels_for, positions_for},
+    jump::{jump_target_for_char_index, labels_for, positions_for},
     overlay::{draw_overlay, with_recovered_screen},
     tmux::{PaneState, TmuxBackend},
 };
@@ -119,7 +119,6 @@ pub fn select_position_index<B: TmuxBackend>(
     }
 
     let labels = labels_for(positions.len(), &config.options.label_keys);
-    let label_len = labels[0].chars().count();
     draw_overlay(
         backend,
         pane,
@@ -128,46 +127,21 @@ pub fn select_position_index<B: TmuxBackend>(
         &labels[..positions.len()],
         &config.overlay_style,
     )?;
-    let prompt = format_jump_prompt(positions.len(), label_len);
-    let Some(input) = backend.prompt_for_label_char(&prompt)? else {
+    let prompt = format_jump_prompt(positions.len());
+    let Some(input) = backend.prompt_for_label_input(&prompt)? else {
         return Ok(None);
     };
 
-    let Some(key_index) = config
-        .options
-        .label_keys
-        .as_slice()
-        .iter()
-        .position(|key| *key == input)
-    else {
+    let Some(key_index) = labels.iter().position(|label| label == &input) else {
         return Ok(None);
     };
 
-    if label_len == 1 {
-        return Ok((key_index < positions.len()).then_some(key_index));
-    }
-
-    let Some(subset) = bounded_subset_bounds(
-        key_index,
-        label_len,
-        positions.len(),
-        config.options.label_keys.len(),
-    ) else {
-        return Ok(None);
-    };
-    let remaining = &positions[subset.clone()];
-    let lower_index = select_position_index(backend, pane, screen, remaining, config)?;
-    Ok(lower_index.map(|value| subset.start + value))
+    Ok((key_index < positions.len()).then_some(key_index))
 }
 
-fn format_jump_prompt(match_count: usize, label_len: usize) -> String {
+fn format_jump_prompt(match_count: usize) -> String {
     let match_label = if match_count == 1 { "match" } else { "matches" };
-    let label_phrase = if label_len == 1 {
-        "1-char labels".to_owned()
-    } else {
-        format!("{label_len}-char labels")
-    };
-    format!("jump char ({match_count} {match_label}, {label_phrase}):")
+    format!("jump label ({match_count} {match_label}):")
 }
 
 #[cfg(test)]
@@ -187,14 +161,14 @@ mod tests {
     struct FakeBackend {
         screen: String,
         prompts_seen: RefCell<Vec<String>>,
-        prompts: RefCell<VecDeque<Option<char>>>,
+        prompts: RefCell<VecDeque<Option<String>>>,
         writes: RefCell<Vec<String>>,
         jumped_to: RefCell<Option<JumpTarget>>,
         messages: RefCell<Vec<String>>,
     }
 
     impl FakeBackend {
-        fn with_prompts(prompts: impl IntoIterator<Item = char>) -> Self {
+        fn with_prompts(prompts: impl IntoIterator<Item = String>) -> Self {
             Self {
                 screen: String::from("qone qtwo qthree qfour"),
                 prompts_seen: RefCell::default(),
@@ -205,7 +179,7 @@ mod tests {
             }
         }
 
-        fn with_prompt_results(prompts: impl IntoIterator<Item = Option<char>>) -> Self {
+        fn with_prompt_results(prompts: impl IntoIterator<Item = Option<String>>) -> Self {
             Self {
                 screen: String::from("qone qtwo qthree qfour"),
                 prompts_seen: RefCell::default(),
@@ -258,7 +232,7 @@ mod tests {
             Ok(())
         }
 
-        fn prompt_for_label_char(&self, prompt: &str) -> Result<Option<char>> {
+        fn prompt_for_label_input(&self, prompt: &str) -> Result<Option<String>> {
             self.prompts_seen.borrow_mut().push(prompt.to_owned());
             Ok(self.prompts.borrow_mut().pop_front().flatten())
         }
@@ -276,7 +250,7 @@ mod tests {
 
     #[test]
     fn jump_flow_selects_second_target_from_label_prompt() -> Result<()> {
-        let backend = FakeBackend::with_prompts(['f']);
+        let backend = FakeBackend::with_prompts([String::from("f")]);
         let config = JumpConfig::from_values(EnvValues::default());
         let report = run_jump_report(
             &backend,
@@ -305,7 +279,7 @@ mod tests {
         assert_eq!(backend.writes.borrow().len(), 3);
         assert_eq!(
             backend.prompts_seen.borrow().as_slice(),
-            ["jump char (4 matches, 1-char labels):"]
+            ["jump label (4 matches):"]
         );
         assert!(
             backend
@@ -319,8 +293,8 @@ mod tests {
     }
 
     #[test]
-    fn jump_flow_formats_prompt_with_match_count_and_label_depth() -> Result<()> {
-        let backend = FakeBackend::with_prompts(['f']);
+    fn jump_flow_formats_prompt_with_match_count() -> Result<()> {
+        let backend = FakeBackend::with_prompts([String::from("f")]);
         let config = JumpConfig::from_values(EnvValues::default());
         let _ = run_jump_report(
             &backend,
@@ -333,7 +307,7 @@ mod tests {
 
         assert_eq!(
             backend.prompts_seen.borrow().as_slice(),
-            ["jump char (4 matches, 1-char labels):"]
+            ["jump label (4 matches):"]
         );
         Ok(())
     }
@@ -455,7 +429,7 @@ mod tests {
     fn jump_flow_selects_non_word_target_through_overlay() -> Result<()> {
         // Many-match non-word target must drive the overlay/label path, not just
         // the single-match auto-jump path.
-        let backend = FakeBackend::with_prompts(['f']).with_screen("a/b/c");
+        let backend = FakeBackend::with_prompts([String::from("f")]).with_screen("a/b/c");
         let report = run_jump_report(
             &backend,
             JumpRequest {
@@ -488,7 +462,7 @@ mod tests {
 
     #[test]
     fn jump_flow_cancels_when_label_prompt_is_invalid() -> Result<()> {
-        let backend = FakeBackend::with_prompts(['x']);
+        let backend = FakeBackend::with_prompts([String::from("x")]);
         let report = run_jump_report(
             &backend,
             JumpRequest {
