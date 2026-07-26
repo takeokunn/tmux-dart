@@ -98,15 +98,21 @@ impl Server {
     fn run_jump(&self, pane: &str, ch: &str, mode: &str) -> Result<()> {
         let socket = self.socket()?;
         let pid = self.tmux(&["display-message", "-p", "-F", "#{pid}"])?;
-        Command::new(BIN)
+        let output = Command::new(BIN)
             .args(["jump", "--char", ch, "--pane-id", pane])
             .env("TMUX", format!("{socket},{pid},0"))
             .env("JUMP_MATCH_MODE", mode)
             .env("JUMP_AUTO_JUMP", "on")
             .env("JUMP_CASE_SENSITIVE", "off")
-            .status()
+            .output()
             .context("spawn tmux-dart binary")?;
-        // The binary reports its own errors; the no-match path exits 0 anyway.
+        if !output.status.success() {
+            bail!(
+                "tmux-dart {:?} failed: {}",
+                ["jump", "--char", ch, "--pane-id", pane],
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
         Ok(())
     }
 
@@ -329,6 +335,12 @@ fn reports_no_match_without_entering_copy_mode() -> Result<()> {
     assert!(
         !server.in_copy_mode(&pane)?,
         "a jump with no matches must not enter copy mode"
+    );
+    assert!(
+        server
+            .tmux(&["show-messages"])?
+            .contains("tmux-dart: no matches for 'Q'"),
+        "a jump with no matches must report the missing target"
     );
     Ok(())
 }

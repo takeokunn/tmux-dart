@@ -263,9 +263,10 @@ dependencies = [
 
 [[package]]
 name = "tmux-dart"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
+ "libc",
  "tempfile",
  "unicode-segmentation",
  "unicode-width",

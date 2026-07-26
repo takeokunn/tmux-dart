@@ -1,8 +1,10 @@
+use std::fmt::Write;
+
 use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    jump::{KeyPosition, display_cell_width_for_char_index, overlay_anchor_for_char_index},
+    jump::{KeyPosition, OverlayCell, overlay_cells_for_char_indices},
     tmux::{PaneState, TmuxBackend},
 };
 
@@ -156,14 +158,39 @@ pub fn alternate_screen_restore_sequence(
     cursor_y: usize,
     cursor_x: usize,
 ) -> String {
-    let mut restore = String::from(RESET_COLORS);
+    let line_break_count = saved_screen
+        .as_bytes()
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count();
+    let mut restore = String::with_capacity(
+        saved_screen
+            .len()
+            .saturating_add(line_break_count)
+            .saturating_add(64),
+    );
+    restore.push_str(RESET_COLORS);
     restore.push_str(RESET_SCROLL_REGION);
     restore.push_str(CLEAR_SEQ);
     // Home explicitly rather than assuming the caller left the cursor there: the
     // saved rows below are written sequentially, so they must start at row 1.
     restore.push_str(HOME_SEQ);
-    restore.push_str(&saved_screen.replace('\n', "\n\r"));
-    restore.push_str(&format!("\u{1b}[{};{}H", cursor_y + 1, cursor_x + 1));
+    for ch in saved_screen.chars() {
+        restore.push(ch);
+        if ch == '\n' {
+            restore.push('\r');
+        }
+    }
+    assert!(
+        write!(
+            restore,
+            "\u{1b}[{};{}H",
+            cursor_y.saturating_add(1),
+            cursor_x.saturating_add(1)
+        )
+        .is_ok(),
+        "writing to a String cannot fail"
+    );
     restore.push_str(RESET_COLORS);
     restore
 }
@@ -179,43 +206,99 @@ pub fn draw_overlay<B: TmuxBackend + ?Sized>(
     backend.write_to_tty(pane, &render_overlay(screen, positions, labels, style))
 }
 
+pub(crate) fn draw_overlay_cells<B: TmuxBackend + ?Sized>(
+    backend: &B,
+    pane: &PaneState,
+    screen: &str,
+    overlay_cells: &[OverlayCell],
+    labels: &[String],
+    style: &OverlayStyle,
+) -> Result<()> {
+    backend.write_to_tty(
+        pane,
+        &render_overlay_cells(screen, overlay_cells, labels, style),
+    )
+}
+
 fn render_overlay(
     screen: &str,
     positions: &[usize],
     labels: &[String],
     style: &OverlayStyle,
 ) -> String {
-    let mut rendered = String::new();
+    let overlay_cells = overlay_cells_for_char_indices(screen, positions);
+    render_overlay_cells(screen, &overlay_cells, labels, style)
+}
+
+fn render_overlay_cells(
+    screen: &str,
+    overlay_cells: &[OverlayCell],
+    labels: &[String],
+    style: &OverlayStyle,
+) -> String {
+    let line_break_count = screen
+        .as_bytes()
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count();
+    let per_label_capacity = style
+        .foreground
+        .len()
+        .saturating_add(style.label_style.len())
+        .saturating_add(RESET_COLORS.len())
+        .saturating_add(32);
+    let capacity = RESET_CLEAR_HOME_SEQ
+        .len()
+        .saturating_add(style.background.len())
+        .saturating_add(screen.len())
+        .saturating_add(line_break_count)
+        .saturating_add(labels.len().saturating_mul(per_label_capacity))
+        .saturating_add(
+            labels
+                .iter()
+                .fold(0usize, |total, label| total.saturating_add(label.len())),
+        )
+        .saturating_add(HOME_SEQ.len());
+    let mut rendered = String::with_capacity(capacity);
     rendered.push_str(RESET_CLEAR_HOME_SEQ);
     rendered.push_str(&style.background);
-    rendered.push_str(&screen.replace('\n', "\n\r"));
+    for ch in screen.chars() {
+        rendered.push(ch);
+        if ch == '\n' {
+            rendered.push('\r');
+        }
+    }
 
-    for (position, label) in positions.iter().zip(labels.iter()) {
-        let display_position = overlay_anchor_for_char_index(screen, *position);
-        let label_width: usize = label
-            .chars()
-            .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
-            .sum();
+    for (cell, label) in overlay_cells.iter().zip(labels.iter()) {
+        let display_position = cell.anchor;
+        let label_width = label.chars().fold(0usize, |width, ch| {
+            width.saturating_add(UnicodeWidthChar::width(ch).unwrap_or(1))
+        });
         let start_column = match style.key_position {
             KeyPosition::Left => display_position.column,
             KeyPosition::Right => {
                 // Whole-cell width, not the width of the char alone: for a
                 // cluster like ☝️ the wideness comes from the variation
                 // selector, and the label must clear the entire cell.
-                display_position.column + display_cell_width_for_char_index(screen, *position)
+                display_position.column.saturating_add(cell.width)
             }
             KeyPosition::OffLeft => display_position.column.saturating_sub(label_width),
         };
 
-        rendered.push_str(&format!(
-            "\u{1b}[{};{}H{}{}{}{}",
-            display_position.row + 1,
-            start_column + 1,
-            style.foreground,
-            style.label_style,
-            label,
-            RESET_COLORS,
-        ));
+        assert!(
+            write!(
+                rendered,
+                "\u{1b}[{};{}H{}{}{}{}",
+                display_position.row.saturating_add(1),
+                start_column.saturating_add(1),
+                style.foreground,
+                style.label_style,
+                label,
+                RESET_COLORS,
+            )
+            .is_ok(),
+            "writing to a String cannot fail"
+        );
     }
 
     rendered.push_str(HOME_SEQ);
@@ -224,10 +307,13 @@ fn render_overlay(
 
 #[cfg(test)]
 mod tests {
+    use std::{hint::black_box, time::Instant};
+
     use super::{
         OverlayStyle, alternate_screen_restore_sequence, decode_tmux_color, render_overlay,
+        render_overlay_cells,
     };
-    use crate::jump::KeyPosition;
+    use crate::jump::{KeyPosition, overlay_cells_for_char_indices};
 
     fn style(key_position: KeyPosition) -> OverlayStyle {
         OverlayStyle {
@@ -292,6 +378,13 @@ mod tests {
         );
         // Cursor is parked back at the TUI's 1-based position (row 3, col 5).
         assert!(restore.contains("\u{1b}[3;5H"));
+    }
+
+    #[test]
+    fn alternate_screen_restore_saturates_untrusted_cursor_coordinates() {
+        let restore = alternate_screen_restore_sequence("screen", usize::MAX, usize::MAX);
+
+        assert!(restore.contains(&format!("\u{1b}[{};{}H", usize::MAX, usize::MAX)));
     }
 
     #[test]
@@ -384,6 +477,20 @@ mod tests {
     }
 
     #[test]
+    fn cached_overlay_cells_preserve_mixed_unicode_rendering() {
+        let screen = "あ☝\u{fe0f} e\u{301}\nalpha";
+        let positions = [0usize, 1, 2, 4, 7];
+        let labels = ["j", "f", "h", "g", "k"].map(String::from);
+        let overlay_style = style(KeyPosition::Right);
+        let cells = overlay_cells_for_char_indices(screen, &positions);
+
+        assert_eq!(
+            render_overlay_cells(screen, &cells, &labels, &overlay_style),
+            render_overlay(screen, &positions, &labels, &overlay_style)
+        );
+    }
+
+    #[test]
     fn decode_tmux_color_supports_single_and_double_escaped_values() {
         assert_eq!(decode_tmux_color(r#"\e[32m"#), "\u{1b}[32m");
         assert_eq!(decode_tmux_color(r#"\\e[32m"#), "\u{1b}[32m");
@@ -402,6 +509,40 @@ mod tests {
         assert_eq!(
             decode_tmux_color(r#"\e]52;c;SGVsbG8=\a\e[31mplain\e[2J"#),
             "\u{1b}[31m"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance measurement"]
+    fn benchmark_render_overlay_mixed_unicode_screen() {
+        const SAMPLE_COUNT: usize = 7;
+        const ITERATIONS_PER_SAMPLE: usize = 400;
+
+        let screen = "alpha あいう ☝\u{fe0f} e\u{301} omega\n".repeat(160);
+        let positions = (0..300).map(|index| index * 2).collect::<Vec<_>>();
+        let labels = (0..positions.len())
+            .map(|index| format!("{:02}", index % 81))
+            .collect::<Vec<_>>();
+        let overlay_style = style(KeyPosition::Right);
+        let mut samples = Vec::with_capacity(SAMPLE_COUNT);
+
+        for _ in 0..SAMPLE_COUNT {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS_PER_SAMPLE {
+                black_box(render_overlay(
+                    black_box(&screen),
+                    black_box(&positions),
+                    black_box(&labels),
+                    black_box(&overlay_style),
+                ));
+            }
+            samples.push(started.elapsed());
+        }
+
+        samples.sort_unstable();
+        eprintln!(
+            "render_overlay: median {:?} for {ITERATIONS_PER_SAMPLE} iterations ({SAMPLE_COUNT} samples)",
+            samples[SAMPLE_COUNT / 2]
         );
     }
 }

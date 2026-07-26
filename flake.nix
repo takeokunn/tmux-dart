@@ -14,13 +14,14 @@
         "x86_64-darwin"
         "aarch64-darwin"
       ];
+      cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
       forAllSystemsWith = f: forAllSystems (system: f nixpkgs.legacyPackages.${system});
       packageFor =
         pkgs:
         pkgs.rustPlatform.buildRustPackage {
           pname = "tmux-dart";
-          version = "0.1.0";
+          version = cargoToml.package.version;
           src = self;
           cargoLock = {
             lockFile = ./Cargo.lock;
@@ -28,7 +29,8 @@
         };
     in
     {
-      formatter = forAllSystemsWith (pkgs:
+      formatter = forAllSystemsWith (
+        pkgs:
         pkgs.writeShellApplication {
           name = "fmt";
           runtimeInputs = with pkgs; [
@@ -40,7 +42,8 @@
             nixfmt "$@"
             cargo fmt
           '';
-        });
+        }
+      );
 
       checks = forAllSystemsWith (pkgs: {
         default =
@@ -60,18 +63,17 @@
               cargo fmt --check
               touch $out
             '';
-        clippy =
-          (packageFor pkgs).overrideAttrs (_old: {
-            pname = "tmux-dart-clippy";
-            nativeBuildInputs = (_old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
-            doCheck = false;
-            buildPhase = ''
-              cargo clippy --all-targets -- -D warnings
-            '';
-            installPhase = ''
-              touch $out
-            '';
-          });
+        clippy = (packageFor pkgs).overrideAttrs (_old: {
+          pname = "tmux-dart-clippy";
+          nativeBuildInputs = (_old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
+          doCheck = false;
+          buildPhase = ''
+            cargo clippy --all-targets -- -D warnings
+          '';
+          installPhase = ''
+            touch $out
+          '';
+        });
         package = packageFor pkgs;
       });
 
