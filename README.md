@@ -16,7 +16,7 @@
 - Supports overlay style presets for brighter, softer, and higher-contrast themes.
 - Uses word-start matching by default.
 - Uses `jfhgkdlsa` as the default label keys.
-- Accepts the full label in one prompt when there are many matches.
+- Narrows multi-key labels one key at a time, redrawing the remaining matches at each depth.
 - Moves to the selected target with tmux copy-mode commands.
 
 ## Prerequisites

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -51,6 +53,12 @@ pub struct OverlayAnchor {
     pub column: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayCell {
+    pub anchor: OverlayAnchor,
+    pub width: usize,
+}
+
 /// Target for driving copy-mode navigation. `column` is a **grid-cell** count
 /// from the start of the row: one copy-mode `cursor-right` press moves exactly
 /// one cell. tmux stores a whole grapheme cluster — a base character plus its
@@ -85,6 +93,21 @@ pub fn overlay_anchor_for_char_index(screen: &str, target_index: usize) -> Overl
     }
 }
 
+/// Locate multiple overlay targets in one grapheme traversal. Results preserve
+/// input order even when indices are unsorted or repeated.
+pub fn overlay_cells_for_char_indices(screen: &str, target_indices: &[usize]) -> Vec<OverlayCell> {
+    cell_positions_for_char_indices(screen, target_indices)
+        .into_iter()
+        .map(|cell| OverlayCell {
+            anchor: OverlayAnchor {
+                row: cell.row,
+                column: cell.display_column,
+            },
+            width: cell.cell_width,
+        })
+        .collect()
+}
+
 /// Locate the character at `target_index` for copy-mode navigation. See
 /// [`JumpTarget`] for why the column is measured in grid cells.
 pub fn jump_target_for_char_index(screen: &str, target_index: usize) -> JumpTarget {
@@ -110,6 +133,7 @@ pub fn display_cell_width_for_char_index(screen: &str, target_index: usize) -> u
 /// and skin-tone modifiers), so both column metrics walk clusters, not chars.
 /// `unicode_width`'s **str** width mirrors that cell's display width (e.g.
 /// ☝ + VS16 → 2), which the per-char width cannot express.
+#[derive(Clone, Copy)]
 struct CellPosition {
     row: usize,
     /// Display column where the cell starts (sum of preceding cell widths).
@@ -121,51 +145,100 @@ struct CellPosition {
 }
 
 fn cell_position_for_char_index(screen: &str, target_index: usize) -> CellPosition {
+    cell_positions_for_char_indices(screen, &[target_index])[0]
+}
+
+fn cell_positions_for_char_indices(screen: &str, target_indices: &[usize]) -> Vec<CellPosition> {
+    if target_indices.is_empty() {
+        return Vec::new();
+    }
+
     let mut row = 0usize;
     let mut display_column = 0usize;
     let mut cell_column = 0usize;
     let mut char_index = 0usize;
+    let mut reordered_targets = if target_indices.windows(2).all(|pair| pair[0] <= pair[1]) {
+        None
+    } else {
+        let mut targets: Vec<_> = target_indices.iter().copied().enumerate().collect();
+        targets.sort_unstable_by_key(|&(_, target_index)| target_index);
+        Some(targets)
+    };
+    let mut positions = vec![
+        CellPosition {
+            row: 0,
+            display_column: 0,
+            cell_column: 0,
+            cell_width: 1,
+        };
+        target_indices.len()
+    ];
+    let mut next_target = 0usize;
 
     for cluster in screen.graphemes(true) {
         let char_count = cluster.chars().count();
-        let cluster_holds_target = target_index < char_index + char_count;
+        let cluster_end = char_index.saturating_add(char_count);
+        let width = UnicodeWidthStr::width(cluster);
 
-        if cluster == "\n" {
-            // A newline "sits" at the end of its row; fall through to the
-            // final return without advancing to the next row.
-            if cluster_holds_target {
+        while let Some((output_index, target_index)) = reordered_targets
+            .as_ref()
+            .and_then(|targets| targets.get(next_target).copied())
+            .or_else(|| {
+                reordered_targets
+                    .is_none()
+                    .then(|| target_indices.get(next_target).copied())
+                    .flatten()
+                    .map(|target_index| (next_target, target_index))
+            })
+        {
+            if target_index >= cluster_end {
                 break;
             }
-            row += 1;
+
+            positions[output_index] = CellPosition {
+                row,
+                display_column,
+                cell_column,
+                cell_width: if cluster == "\n" { 1 } else { width.max(1) },
+            };
+            next_target = next_target.saturating_add(1);
+        }
+
+        if next_target == target_indices.len() {
+            break;
+        }
+
+        if cluster == "\n" {
+            row = row.saturating_add(1);
             display_column = 0;
             cell_column = 0;
         } else {
-            let width = UnicodeWidthStr::width(cluster);
-            if cluster_holds_target {
-                return CellPosition {
-                    row,
-                    display_column,
-                    cell_column,
-                    cell_width: width.max(1),
-                };
-            }
             // A width-0 cluster is an orphan combining mark with no base
             // character; tmux drops it from the grid, so it occupies no cell.
             if width > 0 {
-                display_column += width;
-                cell_column += 1;
+                display_column = display_column.saturating_add(width);
+                cell_column = cell_column.saturating_add(1);
             }
         }
 
-        char_index += char_count;
+        char_index = cluster_end;
     }
 
-    CellPosition {
+    let fallback = CellPosition {
         row,
         display_column,
         cell_column,
         cell_width: 1,
+    };
+    if let Some(ordered_targets) = reordered_targets.as_mut() {
+        for &(output_index, _) in &ordered_targets[next_target..] {
+            positions[output_index] = fallback;
+        }
+    } else {
+        positions[next_target..].fill(fallback);
     }
+
+    positions
 }
 
 pub fn positions_of(target: char, screen: &str) -> Vec<usize> {
@@ -178,11 +251,10 @@ pub fn positions_for(
     match_mode: MatchMode,
     case_sensitive: bool,
 ) -> Vec<usize> {
-    let chars: Vec<char> = screen.chars().collect();
     match match_mode {
-        MatchMode::Word => word_positions(target, &chars, case_sensitive),
-        MatchMode::Char => char_positions(target, &chars, case_sensitive),
-        MatchMode::Line => line_positions(target, &chars, case_sensitive),
+        MatchMode::Word => word_positions(target, screen, case_sensitive),
+        MatchMode::Char => char_positions(target, screen, case_sensitive),
+        MatchMode::Line => line_positions(target, screen, case_sensitive),
     }
 }
 
@@ -194,66 +266,46 @@ fn chars_match(lhs: char, rhs: char, case_sensitive: bool) -> bool {
     }
 }
 
-fn word_positions(target: char, chars: &[char], case_sensitive: bool) -> Vec<usize> {
+fn word_positions(target: char, screen: &str, case_sensitive: bool) -> Vec<usize> {
     // Word-start matching is only meaningful for word characters. A non-word
     // target (punctuation, symbols, whitespace) can never be at a word start,
     // so fall back to matching every occurrence instead of returning nothing.
     if !is_word_char(target) {
-        return char_positions(target, chars, case_sensitive);
+        return char_positions(target, screen, case_sensitive);
     }
 
     let mut positions = Vec::new();
-
-    if let Some(first) = chars.first()
-        && is_word_char(*first)
-        && chars_match(*first, target, case_sensitive)
-    {
-        positions.push(0);
-    }
-
-    for index in 0..chars.len().saturating_sub(1) {
-        if !is_word_char(chars[index])
-            && is_word_char(chars[index + 1])
-            && chars_match(chars[index + 1], target, case_sensitive)
-        {
-            positions.push(index + 1);
+    let mut previous_was_word = false;
+    for (index, ch) in screen.chars().enumerate() {
+        let is_word = is_word_char(ch);
+        if is_word && !previous_was_word && chars_match(ch, target, case_sensitive) {
+            positions.push(index);
         }
+        previous_was_word = is_word;
     }
 
     positions
 }
 
-fn char_positions(target: char, chars: &[char], case_sensitive: bool) -> Vec<usize> {
-    chars
-        .iter()
+fn char_positions(target: char, screen: &str, case_sensitive: bool) -> Vec<usize> {
+    screen
+        .chars()
         .enumerate()
-        .filter_map(|(index, ch)| chars_match(*ch, target, case_sensitive).then_some(index))
+        .filter_map(|(index, ch)| chars_match(ch, target, case_sensitive).then_some(index))
         .collect()
 }
 
-fn line_positions(target: char, chars: &[char], case_sensitive: bool) -> Vec<usize> {
+fn line_positions(target: char, screen: &str, case_sensitive: bool) -> Vec<usize> {
     let mut positions = Vec::new();
-    let mut line_start = 0usize;
-
-    loop {
-        let Some((offset, ch)) = chars[line_start..]
-            .iter()
-            .enumerate()
-            .find(|(_, ch)| **ch != ' ' && **ch != '\t' && **ch != '\n')
-        else {
-            break;
-        };
-        let position = line_start + offset;
-        if chars_match(*ch, target, case_sensitive) {
-            positions.push(position);
-        }
-
-        let Some(next_newline) = chars[position..].iter().position(|ch| *ch == '\n') else {
-            break;
-        };
-        line_start = position + next_newline + 1;
-        if line_start >= chars.len() {
-            break;
+    let mut awaiting_line_content = true;
+    for (index, ch) in screen.chars().enumerate() {
+        if ch == '\n' {
+            awaiting_line_content = true;
+        } else if awaiting_line_content && ch != ' ' && ch != '\t' {
+            if chars_match(ch, target, case_sensitive) {
+                positions.push(index);
+            }
+            awaiting_line_content = false;
         }
     }
 
@@ -269,13 +321,17 @@ pub struct LabelKeys(Vec<char>);
 
 impl LabelKeys {
     /// Parse label keys from a raw option value, keeping the first occurrence of
-    /// each non-whitespace character. Falls back to [`LabelKeys::default`] when
-    /// fewer than two distinct keys remain, since a single key cannot form a
-    /// distinguishable label alphabet.
+    /// each non-whitespace, non-control character. Falls back to
+    /// [`LabelKeys::default`] when fewer than two distinct keys remain, since a
+    /// single key cannot form a distinguishable label alphabet.
     pub fn from_env(value: &str) -> Self {
         let mut keys = Vec::new();
-        for ch in value.chars().filter(|ch| !ch.is_whitespace()) {
-            if !keys.contains(&ch) {
+        let mut seen = HashSet::new();
+        for ch in value
+            .chars()
+            .filter(|ch| !ch.is_whitespace() && !ch.is_control())
+        {
+            if seen.insert(ch) {
                 keys.push(ch);
             }
         }
@@ -310,26 +366,55 @@ impl Default for LabelKeys {
 }
 
 pub fn labels_for(position_count: usize, label_keys: &LabelKeys) -> Vec<String> {
-    let label_keys = label_keys.as_slice();
-    let mut labels: Vec<String> = label_keys.iter().map(char::to_string).collect();
-    while position_count > labels.len() {
-        labels = labels
-            .iter()
-            .flat_map(|prefix| {
-                label_keys
-                    .iter()
-                    .map(move |suffix| format!("{prefix}{suffix}"))
-            })
-            .collect();
-    }
-    labels
+    labels_up_to(position_count, label_keys)
 }
 
 pub fn label_length_for(position_count: usize, label_keys: &LabelKeys) -> usize {
-    labels_for(position_count, label_keys)
-        .first()
-        .map(|s| s.chars().count())
-        .unwrap_or(1)
+    label_length_for_count(position_count, label_keys.len())
+}
+
+pub fn labels_up_to(position_count: usize, label_keys: &LabelKeys) -> Vec<String> {
+    let label_keys = label_keys.as_slice();
+    if position_count == 0 {
+        return Vec::new();
+    }
+
+    let label_len = label_length_for_count(position_count, label_keys.len());
+    (0..position_count)
+        .map(|index| label_for_index(index, label_len, label_keys))
+        .collect()
+}
+
+fn label_length_for_count(position_count: usize, label_key_count: usize) -> usize {
+    debug_assert!(label_key_count >= 2);
+
+    let mut label_len = 1usize;
+    let mut capacity = label_key_count;
+    while position_count > capacity {
+        label_len += 1;
+        capacity = capacity.saturating_mul(label_key_count);
+    }
+
+    label_len
+}
+
+fn label_for_index(index: usize, label_len: usize, label_keys: &[char]) -> String {
+    let key_count = label_keys.len();
+    debug_assert!(label_len <= usize::BITS as usize);
+    let mut digits = [0usize; usize::BITS as usize];
+    let mut value = index;
+
+    for slot in (0..label_len).rev() {
+        digits[slot] = value % key_count;
+        value /= key_count;
+    }
+
+    debug_assert_eq!(value, 0);
+
+    digits[..label_len]
+        .iter()
+        .map(|&digit| label_keys[digit])
+        .collect()
 }
 
 pub fn subset_bounds(
@@ -337,9 +422,10 @@ pub fn subset_bounds(
     label_len: usize,
     label_key_count: usize,
 ) -> std::ops::Range<usize> {
-    let magnitude = label_key_count.pow((label_len.saturating_sub(1)) as u32);
-    let start = key_index * magnitude;
-    start..(start + magnitude)
+    let exponent = u32::try_from(label_len.saturating_sub(1)).unwrap_or(u32::MAX);
+    let magnitude = label_key_count.saturating_pow(exponent);
+    let start = key_index.saturating_mul(magnitude);
+    start..start.saturating_add(magnitude)
 }
 
 pub fn bounded_subset_bounds(
@@ -360,11 +446,11 @@ pub fn bounded_subset_bounds(
 mod tests {
     use super::{
         DEFAULT_LABEL_KEYS, LabelKeys, MatchMode, bounded_subset_bounds, label_length_for,
-        labels_for, positions_for, positions_of, subset_bounds,
+        labels_for, labels_up_to, positions_for, positions_of, subset_bounds,
     };
     use crate::jump::{
-        JumpTarget, KeyPosition, OverlayAnchor, display_cell_width_for_char_index,
-        jump_target_for_char_index, overlay_anchor_for_char_index,
+        JumpTarget, KeyPosition, OverlayAnchor, OverlayCell, display_cell_width_for_char_index,
+        jump_target_for_char_index, overlay_anchor_for_char_index, overlay_cells_for_char_indices,
     };
 
     #[test]
@@ -429,6 +515,37 @@ mod tests {
         assert_eq!(
             overlay_anchor_for_char_index("あいう x\nab", 6),
             OverlayAnchor { row: 1, column: 0 }
+        );
+    }
+
+    #[test]
+    fn overlay_cells_preserve_unsorted_duplicate_target_order() {
+        let cells = overlay_cells_for_char_indices("☝\u{fe0f} x\nab", &[5, 0, 1, 0, usize::MAX]);
+
+        assert_eq!(
+            cells,
+            vec![
+                OverlayCell {
+                    anchor: OverlayAnchor { row: 1, column: 0 },
+                    width: 1,
+                },
+                OverlayCell {
+                    anchor: OverlayAnchor { row: 0, column: 0 },
+                    width: 2,
+                },
+                OverlayCell {
+                    anchor: OverlayAnchor { row: 0, column: 0 },
+                    width: 2,
+                },
+                OverlayCell {
+                    anchor: OverlayAnchor { row: 0, column: 0 },
+                    width: 2,
+                },
+                OverlayCell {
+                    anchor: OverlayAnchor { row: 1, column: 2 },
+                    width: 1,
+                },
+            ]
         );
     }
 
@@ -546,12 +663,33 @@ mod tests {
     #[test]
     fn labels_expand_in_easymotion_order() {
         let keys = LabelKeys::default();
-        assert_eq!(labels_for(1, &keys).len(), DEFAULT_LABEL_KEYS.len());
+        assert_eq!(labels_for(0, &keys).len(), 0);
+        assert_eq!(labels_for(1, &keys).len(), 1);
         assert_eq!(label_length_for(DEFAULT_LABEL_KEYS.len(), &keys), 1);
         assert_eq!(label_length_for(DEFAULT_LABEL_KEYS.len() + 1, &keys), 2);
         assert_eq!(
             labels_for(DEFAULT_LABEL_KEYS.len() + 1, &keys).len(),
-            DEFAULT_LABEL_KEYS.len().pow(2)
+            DEFAULT_LABEL_KEYS.len() + 1
+        );
+    }
+
+    #[test]
+    fn labels_up_to_returns_only_the_requested_prefix() {
+        let keys = LabelKeys::default();
+        assert!(labels_up_to(0, &keys).is_empty());
+        assert_eq!(
+            labels_up_to(4, &keys),
+            vec!["j", "f", "h", "g"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            labels_up_to(DEFAULT_LABEL_KEYS.len() + 1, &keys),
+            vec!["jj", "jf", "jh", "jg", "jk", "jd", "jl", "js", "ja", "fj"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -578,15 +716,19 @@ mod tests {
     }
 
     #[test]
+    fn subset_bounds_saturate_for_untrusted_sizes() {
+        assert_eq!(subset_bounds(usize::MAX, 2, 2), usize::MAX..usize::MAX);
+        assert_eq!(subset_bounds(1, usize::MAX, 2), usize::MAX..usize::MAX);
+        assert_eq!(bounded_subset_bounds(usize::MAX, 2, usize::MAX, 2), None);
+    }
+
+    #[test]
     fn supports_custom_label_keys() {
         let keys = LabelKeys::from_env("abcaa");
         assert_eq!(keys.as_slice(), ['a', 'b', 'c']);
         assert_eq!(keys.len(), 3);
         assert!(!keys.is_empty());
-        assert_eq!(
-            labels_for(4, &keys),
-            vec!["aa", "ab", "ac", "ba", "bb", "bc", "ca", "cb", "cc"]
-        );
+        assert_eq!(labels_for(4, &keys), vec!["aa", "ab", "ac", "ba"]);
         // Fewer than two distinct keys is not a usable alphabet -> default.
         assert_eq!(LabelKeys::from_env("a"), LabelKeys::default());
         assert_eq!(LabelKeys::from_env("aaa"), LabelKeys::default());
@@ -594,12 +736,26 @@ mod tests {
         assert_eq!(LabelKeys::from_env(""), LabelKeys::default());
         // Whitespace is dropped; surrounding spaces don't defeat the alphabet.
         assert_eq!(LabelKeys::from_env(" a b ").as_slice(), ['a', 'b']);
+        // Control characters must never reach raw terminal rendering.
+        assert_eq!(LabelKeys::from_env("a\u{1b}b\u{7f}").as_slice(), ['a', 'b']);
+        assert_eq!(LabelKeys::from_env("a\u{1b}\u{7f}"), LabelKeys::default());
     }
 
     #[test]
     fn label_keys_are_never_shorter_than_two() {
         // The core invariant of LabelKeys, checked over many raw inputs.
-        for raw in ["", " ", "x", "xx", "  x  ", "\t\n", "ab", "abcabc", "j f h"] {
+        for raw in [
+            "",
+            " ",
+            "x",
+            "xx",
+            "  x  ",
+            "\t\n",
+            "\u{1b}\u{7f}",
+            "ab",
+            "abcabc",
+            "j f h",
+        ] {
             let keys = LabelKeys::from_env(raw);
             assert!(
                 keys.len() >= 2,
@@ -620,14 +776,32 @@ mod tests {
         for keys in [LabelKeys::default(), LabelKeys::from_env("abc")] {
             for count in 1..=60usize {
                 let labels = labels_for(count, &keys);
-                assert!(
-                    labels.len() >= count,
-                    "labels_for({count}) produced too few labels"
-                );
+                let prefix = labels_up_to(count, &keys);
+                assert_eq!(labels.len(), count, "labels_for({count}) overallocated");
+                assert_eq!(prefix, labels, "labels_up_to({count}) changed label order");
                 let len = label_length_for(count, &keys);
-                assert!(labels.iter().all(|label| label.chars().count() == len));
-                let unique: std::collections::HashSet<&String> = labels.iter().collect();
-                assert_eq!(unique.len(), labels.len(), "labels_for({count}) had dupes");
+                assert!(prefix.iter().all(|label| label.chars().count() == len));
+                let unique: std::collections::HashSet<&String> = prefix.iter().collect();
+                assert_eq!(
+                    unique.len(),
+                    prefix.len(),
+                    "labels_up_to({count}) had dupes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn label_prefixes_match_full_generation_at_length_boundaries() {
+        for keys in [LabelKeys::default(), LabelKeys::from_env("abc")] {
+            let radix = keys.len();
+            for count in [1, radix, radix + 1, radix.pow(2), radix.pow(2) + 1] {
+                let labels = labels_for(count, &keys);
+                assert_eq!(
+                    labels_up_to(count, &keys),
+                    labels,
+                    "label order changed at count {count} for radix {radix}"
+                );
             }
         }
     }

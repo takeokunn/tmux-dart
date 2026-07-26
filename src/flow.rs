@@ -2,8 +2,11 @@ use anyhow::{Context, Result};
 
 use crate::{
     config::JumpConfig,
-    jump::{jump_target_for_char_index, labels_for, positions_for},
-    overlay::{draw_overlay, with_recovered_screen},
+    jump::{
+        OverlayCell, bounded_subset_bounds, jump_target_for_char_index, label_length_for,
+        labels_up_to, overlay_cells_for_char_indices, positions_for,
+    },
+    overlay::{draw_overlay_cells, with_recovered_screen},
     tmux::{PaneState, TmuxBackend},
 };
 
@@ -118,30 +121,77 @@ pub fn select_position_index<B: TmuxBackend>(
         return Ok(Some(0));
     }
 
-    let labels = labels_for(positions.len(), &config.options.label_keys);
-    draw_overlay(
+    let overlay_cells = overlay_cells_for_char_indices(screen, positions);
+    select_position_index_from(backend, pane, screen, positions, &overlay_cells, config, 0)
+}
+
+fn select_position_index_from<B: TmuxBackend>(
+    backend: &B,
+    pane: &PaneState,
+    screen: &str,
+    positions: &[usize],
+    overlay_cells: &[OverlayCell],
+    config: &JumpConfig,
+    offset: usize,
+) -> Result<Option<usize>> {
+    if positions.len() == 1 {
+        return Ok(Some(offset));
+    }
+
+    let label_len = label_length_for(positions.len(), &config.options.label_keys);
+    let labels = labels_up_to(positions.len(), &config.options.label_keys);
+    draw_overlay_cells(
         backend,
         pane,
         screen,
-        positions,
-        &labels[..positions.len()],
+        overlay_cells,
+        &labels,
         &config.overlay_style,
     )?;
-    let prompt = format_jump_prompt(positions.len());
+    let prompt = format_jump_prompt(positions.len(), label_len);
     let Some(input) = backend.prompt_for_label_input(&prompt)? else {
         return Ok(None);
     };
 
-    let Some(key_index) = labels.iter().position(|label| label == &input) else {
+    let mut input_chars = input.chars();
+    let Some(input_key) = input_chars.next() else {
+        return Ok(None);
+    };
+    if input_chars.next().is_some() {
+        return Ok(None);
+    }
+    let Some(key_index) = config
+        .options
+        .label_keys
+        .as_slice()
+        .iter()
+        .position(|key| *key == input_key)
+    else {
+        return Ok(None);
+    };
+    let Some(bounds) = bounded_subset_bounds(
+        key_index,
+        label_len,
+        positions.len(),
+        config.options.label_keys.len(),
+    ) else {
         return Ok(None);
     };
 
-    Ok((key_index < positions.len()).then_some(key_index))
+    select_position_index_from(
+        backend,
+        pane,
+        screen,
+        &positions[bounds.clone()],
+        &overlay_cells[bounds.clone()],
+        config,
+        offset.saturating_add(bounds.start),
+    )
 }
 
-fn format_jump_prompt(match_count: usize) -> String {
+fn format_jump_prompt(match_count: usize, label_depth: usize) -> String {
     let match_label = if match_count == 1 { "match" } else { "matches" };
-    format!("jump label ({match_count} {match_label}):")
+    format!("jump key ({match_count} {match_label}, depth {label_depth}):")
 }
 
 #[cfg(test)]
@@ -279,7 +329,7 @@ mod tests {
         assert_eq!(backend.writes.borrow().len(), 3);
         assert_eq!(
             backend.prompts_seen.borrow().as_slice(),
-            ["jump label (4 matches):"]
+            ["jump key (4 matches, depth 1):"]
         );
         assert!(
             backend
@@ -307,8 +357,64 @@ mod tests {
 
         assert_eq!(
             backend.prompts_seen.borrow().as_slice(),
-            ["jump label (4 matches):"]
+            ["jump key (4 matches, depth 1):"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn jump_flow_narrows_multi_key_labels_one_key_at_a_time() -> Result<()> {
+        let screen = (0..10)
+            .map(|index| format!("q{index} "))
+            .collect::<String>();
+        let backend =
+            FakeBackend::with_prompts([String::from("j"), String::from("f")]).with_screen(&screen);
+        let config = JumpConfig::from_values(EnvValues::default());
+
+        let report = run_jump_report(
+            &backend,
+            JumpRequest {
+                initial_char: 'q',
+                pane_id: None,
+                config,
+            },
+        )?;
+
+        assert_eq!(report.state, JumpState::Done);
+        assert_eq!(
+            *backend.jumped_to.borrow(),
+            Some(JumpTarget { row: 0, column: 3 })
+        );
+        assert_eq!(
+            backend.prompts_seen.borrow().as_slice(),
+            [
+                "jump key (10 matches, depth 2):",
+                "jump key (9 matches, depth 1):"
+            ]
+        );
+        // Each overlay is bracketed by alternate-screen enter/restore writes.
+        assert_eq!(backend.writes.borrow().len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn jump_flow_rejects_a_full_multi_key_label_in_one_prompt() -> Result<()> {
+        let screen = (0..10)
+            .map(|index| format!("q{index} "))
+            .collect::<String>();
+        let backend = FakeBackend::with_prompts([String::from("jf")]).with_screen(&screen);
+
+        let report = run_jump_report(
+            &backend,
+            JumpRequest {
+                initial_char: 'q',
+                pane_id: None,
+                config: JumpConfig::from_values(EnvValues::default()),
+            },
+        )?;
+
+        assert_eq!(report.state, JumpState::Cancelled);
+        assert_eq!(*backend.jumped_to.borrow(), None);
         Ok(())
     }
 

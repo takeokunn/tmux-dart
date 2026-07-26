@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-26
+
+### Changed
+
+- Label selection is recursive and accepts one key per prompt, restoring compatibility with tmux-jump muscle memory while retaining deterministic labels for large match sets.
+- Copy-mode navigation is sent as one tmux command list instead of starting a subprocess for every movement, reducing movement process launches from as many as seven to three.
+- Overlay rendering now reuses precomputed cells and reserved buffers, nearly doubling throughput in the mixed-Unicode render benchmark.
+- Prompt polling reacts every 5 ms during the initial input window, then backs off progressively to avoid unnecessary idle wakeups.
+
+### Fixed
+
+- Prompt-file reads are bounded, reject non-regular files and invalid UTF-8, and do not block on FIFOs.
+- Arithmetic around pane history, cursor movement, label generation, and overlay placement now handles extreme values without wrapping or panicking.
+- Real-tmux regression coverage now verifies the recursive selection flow and command-list navigation.
+
+## [0.1.7] - 2026-07-09
+
 ### Fixed
 
 - Jumps no longer drift inside TUIs (vim splits, htop, anything with a fixed header/footer). Such apps narrow the terminal scroll region (`DECSTBM`), which `ESC[2J` does not clear; painting the multi-match overlay and restoring the screen then scrolled inside that stale region and shifted every row. The overlay and restore now reset the scroll region (`ESC[r`) before repainting, and the restore homes the cursor explicitly instead of relying on the overlay having left it there.
@@ -39,5 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Case-sensitive matching option (`@jump-case-sensitive`)
 - Unit test coverage with `FakeBackend` mock implementing the `TmuxBackend` trait
 
-[Unreleased]: https://github.com/takeokunn/tmux-dart/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/takeokunn/tmux-dart/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/takeokunn/tmux-dart/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/takeokunn/tmux-dart/compare/v0.1.0...v0.1.7
 [0.1.0]: https://github.com/takeokunn/tmux-dart/releases/tag/v0.1.0

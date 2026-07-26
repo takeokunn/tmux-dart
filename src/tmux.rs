@@ -1,15 +1,28 @@
 use std::{
-    fs,
-    io::ErrorKind,
+    ffi::OsStr,
+    fmt::Debug,
+    fs::OpenOptions,
+    io::{ErrorKind, Read},
     process::Command,
     thread,
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use tempfile::NamedTempFile;
 
 use crate::jump::JumpTarget;
+
+const MAX_INITIAL_CHAR_FILE_BYTES: usize = 8;
+const MAX_LABEL_INPUT_FILE_BYTES: usize = 4 * 1024;
+const PROMPT_FAST_POLL_WINDOW: Duration = Duration::from_millis(250);
+const PROMPT_RESPONSIVE_POLL_WINDOW: Duration = Duration::from_secs(1);
+const PROMPT_FAST_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const PROMPT_RESPONSIVE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const PROMPT_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub struct PaneState {
@@ -130,7 +143,8 @@ fn pane_history_size(pane_id: &str) -> Result<usize> {
 /// capture and the jump would both land `delta` rows below the content the
 /// user saw. Saturating: `clear-history` during selection cannot underflow.
 fn rebased_scroll_position(pane: &PaneState, history_size_now: usize) -> usize {
-    pane.scroll_position + history_size_now.saturating_sub(pane.history_size)
+    pane.scroll_position
+        .saturating_add(history_size_now.saturating_sub(pane.history_size))
 }
 
 fn parse_usize_or_zero(value: &str, field: &str) -> Result<usize> {
@@ -143,8 +157,7 @@ fn parse_usize_or_zero(value: &str, field: &str) -> Result<usize> {
 
 pub fn capture_visible_pane(pane: &PaneState) -> Result<String> {
     let scroll = rebased_scroll_position(pane, pane_history_size(&pane.pane_id)?);
-    let start = -(scroll as isize);
-    let end = start + pane.pane_height as isize - 1;
+    let (start, end) = capture_range(scroll, pane.pane_height)?;
     tmux_capture_output([
         "capture-pane",
         "-p",
@@ -155,7 +168,24 @@ pub fn capture_visible_pane(pane: &PaneState) -> Result<String> {
         "-E",
         &end.to_string(),
     ])
-    .map(|screen| screen.replace('\u{fe0e}', ""))
+    .map(|mut screen| {
+        screen.retain(|ch| ch != '\u{fe0e}');
+        screen
+    })
+}
+
+fn capture_range(scroll: usize, pane_height: usize) -> Result<(isize, isize)> {
+    let scroll = isize::try_from(scroll).context("tmux scroll position exceeds supported range")?;
+    let pane_height =
+        isize::try_from(pane_height).context("tmux pane height exceeds supported range")?;
+    ensure!(pane_height > 0, "tmux pane height must be positive");
+    let start = scroll
+        .checked_neg()
+        .context("tmux scroll position exceeds supported range")?;
+    let end = start
+        .checked_add(pane_height - 1)
+        .context("tmux capture range exceeds supported range")?;
+    Ok((start, end))
 }
 
 pub fn capture_pane_with_escapes(pane_id: &str) -> Result<String> {
@@ -181,32 +211,27 @@ fn wait_for_char_file(
     let started_at = Instant::now();
     let deadline = started_at + timeout;
     let activity_change_grace_period = Duration::from_millis(250);
+    let mut next_activity_check = started_at + activity_change_grace_period;
+    let mut file_was_observed = false;
 
     loop {
-        if let Some(ch) = read_single_char_from_file(path)? {
-            return Ok(Some(ch));
+        if let Some(content) = read_bounded_utf8_file(path, MAX_INITIAL_CHAR_FILE_BYTES)? {
+            file_was_observed = true;
+            if let Some(ch) = parse_single_char_content(&content)? {
+                return Ok(Some(ch));
+            }
         }
 
-        if started_at.elapsed() >= activity_change_grace_period
-            && let Some(previous_activity) = previous_activity
-            && session_activity()? != previous_activity
-        {
+        if session_activity_changed(previous_activity, &mut next_activity_check)? {
             return Ok(None);
         }
 
         if Instant::now() >= deadline {
+            ensure!(file_was_observed, "prompt file was not found: {path}");
             return Ok(None);
         }
 
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn read_single_char_from_file(path: &str) -> Result<Option<char>> {
-    match fs::read_to_string(path) {
-        Ok(content) => parse_single_char_content(&content),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read prompt file {path}")),
+        sleep_until_next_prompt_poll(started_at, deadline);
     }
 }
 
@@ -224,6 +249,10 @@ fn parse_single_char_content(content: &str) -> Result<Option<char>> {
         chars.next().is_none(),
         "prompt file must contain exactly one character"
     );
+    ensure!(
+        !first.is_control(),
+        "prompt file does not accept control characters"
+    );
     Ok(Some(first))
 }
 
@@ -234,6 +263,7 @@ pub fn prompt_for_label_input(prompt: &str) -> Result<Option<String>> {
 
     tmux_success([
         "command-prompt",
+        "-1",
         "-p",
         prompt,
         &prompt_for_label_input_command(&quoted_path),
@@ -251,16 +281,14 @@ fn wait_for_prompt_file(
     let started_at = Instant::now();
     let deadline = started_at + timeout;
     let activity_change_grace_period = Duration::from_millis(250);
+    let mut next_activity_check = started_at + activity_change_grace_period;
 
     loop {
         if let Some(input) = read_prompt_input_from_file(path)? {
             return Ok(Some(input));
         }
 
-        if started_at.elapsed() >= activity_change_grace_period
-            && let Some(previous_activity) = previous_activity
-            && session_activity()? != previous_activity
-        {
+        if session_activity_changed(previous_activity, &mut next_activity_check)? {
             return Ok(None);
         }
 
@@ -268,16 +296,85 @@ fn wait_for_prompt_file(
             return Ok(None);
         }
 
-        thread::sleep(Duration::from_millis(50));
+        sleep_until_next_prompt_poll(started_at, deadline);
     }
 }
 
-fn read_prompt_input_from_file(path: &str) -> Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(content) => parse_prompt_content(&content),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read prompt file {path}")),
+fn prompt_poll_interval(elapsed: Duration) -> Duration {
+    if elapsed < PROMPT_FAST_POLL_WINDOW {
+        PROMPT_FAST_POLL_INTERVAL
+    } else if elapsed < PROMPT_RESPONSIVE_POLL_WINDOW {
+        PROMPT_RESPONSIVE_POLL_INTERVAL
+    } else {
+        PROMPT_IDLE_POLL_INTERVAL
     }
+}
+
+fn sleep_until_next_prompt_poll(started_at: Instant, deadline: Instant) {
+    let now = Instant::now();
+    let interval = prompt_poll_interval(now.saturating_duration_since(started_at));
+    thread::sleep(interval.min(deadline.saturating_duration_since(now)));
+}
+
+fn session_activity_changed(
+    previous_activity: Option<&str>,
+    next_check: &mut Instant,
+) -> Result<bool> {
+    let Some(previous_activity) = previous_activity else {
+        return Ok(false);
+    };
+    let now = Instant::now();
+    if now < *next_check {
+        return Ok(false);
+    }
+
+    *next_check = now + Duration::from_millis(250);
+    Ok(session_activity()? != previous_activity)
+}
+
+fn read_prompt_input_from_file(path: &str) -> Result<Option<String>> {
+    let Some(content) = read_bounded_utf8_file(path, MAX_LABEL_INPUT_FILE_BYTES)? else {
+        return Ok(None);
+    };
+    parse_prompt_content(&content)
+}
+
+fn read_bounded_utf8_file(path: &str, limit: usize) -> Result<Option<String>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to open prompt file {path}"));
+        }
+    };
+    ensure!(
+        file.metadata()
+            .with_context(|| format!("failed to inspect prompt file {path}"))?
+            .is_file(),
+        "prompt path is not a regular file: {path}"
+    );
+    let read_limit = limit
+        .checked_add(1)
+        .context("prompt file byte limit exceeds supported range")?;
+    let read_limit_u64 =
+        u64::try_from(read_limit).context("prompt file byte limit exceeds supported range")?;
+    let mut bytes = Vec::with_capacity(read_limit);
+    file.by_ref()
+        .take(read_limit_u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read prompt file {path}"))?;
+    ensure!(
+        bytes.len() <= limit,
+        "prompt file exceeds {limit} byte limit"
+    );
+    String::from_utf8(bytes)
+        .context("prompt file must contain valid UTF-8")
+        .map(Some)
 }
 
 fn parse_prompt_content(content: &str) -> Result<Option<String>> {
@@ -304,9 +401,8 @@ pub fn jump_to_position(pane: &PaneState, jump_to: JumpTarget) -> Result<()> {
     // right after stays valid even while the pane keeps producing output.
     tmux_success(["copy-mode", "-t", &pane.pane_id])?;
     let scroll_up = rebased_scroll_position(pane, pane_history_size(&pane.pane_id)?);
-    for command in copy_mode_movement_commands(scroll_up, jump_to) {
-        send_copy_mode_jump_command(pane, command)?;
-    }
+    let commands = copy_mode_movement_commands(scroll_up, jump_to);
+    send_copy_mode_jump_commands(pane, &commands)?;
 
     Ok(())
 }
@@ -342,51 +438,56 @@ fn copy_mode_movement_commands(scroll_up: usize, jump_to: JumpTarget) -> Vec<Cop
     commands
 }
 
-fn send_copy_mode_jump_command(pane: &PaneState, command: CopyModeJumpCommand) -> Result<()> {
-    match command {
-        CopyModeJumpCommand::StartOfLine => {
-            tmux_success(["send-keys", "-X", "-t", &pane.pane_id, "start-of-line"])
+fn send_copy_mode_jump_commands(pane: &PaneState, commands: &[CopyModeJumpCommand]) -> Result<()> {
+    let args = copy_mode_movement_args(&pane.pane_id, commands);
+    if args.is_empty() {
+        return Ok(());
+    }
+    tmux_success_args(&args)
+}
+
+fn copy_mode_movement_args(pane_id: &str, commands: &[CopyModeJumpCommand]) -> Vec<String> {
+    let mut args = Vec::with_capacity(commands.len().saturating_mul(8));
+
+    for (index, command) in commands.iter().enumerate() {
+        if index > 0 {
+            args.push(String::from(";"));
         }
-        CopyModeJumpCommand::TopLine => {
-            tmux_success(["send-keys", "-X", "-t", &pane.pane_id, "top-line"])
-        }
-        CopyModeJumpCommand::CursorUp(count) => {
-            let count = count.to_string();
-            tmux_success([
-                "send-keys",
-                "-X",
-                "-t",
-                &pane.pane_id,
-                "-N",
-                &count,
-                "cursor-up",
-            ])
-        }
-        CopyModeJumpCommand::CursorDown(count) => {
-            let count = count.to_string();
-            tmux_success([
-                "send-keys",
-                "-X",
-                "-t",
-                &pane.pane_id,
-                "-N",
-                &count,
-                "cursor-down",
-            ])
-        }
-        CopyModeJumpCommand::CursorRight(count) => {
-            let count = count.to_string();
-            tmux_success([
-                "send-keys",
-                "-X",
-                "-t",
-                &pane.pane_id,
-                "-N",
-                &count,
-                "cursor-right",
-            ])
+        args.extend([
+            String::from("send-keys"),
+            String::from("-X"),
+            String::from("-t"),
+            pane_id.to_owned(),
+        ]);
+
+        match command {
+            CopyModeJumpCommand::StartOfLine => args.push(String::from("start-of-line")),
+            CopyModeJumpCommand::TopLine => args.push(String::from("top-line")),
+            CopyModeJumpCommand::CursorUp(count) => {
+                args.extend([
+                    String::from("-N"),
+                    count.to_string(),
+                    String::from("cursor-up"),
+                ]);
+            }
+            CopyModeJumpCommand::CursorDown(count) => {
+                args.extend([
+                    String::from("-N"),
+                    count.to_string(),
+                    String::from("cursor-down"),
+                ]);
+            }
+            CopyModeJumpCommand::CursorRight(count) => {
+                args.extend([
+                    String::from("-N"),
+                    count.to_string(),
+                    String::from("cursor-right"),
+                ]);
+            }
         }
     }
+
+    args
 }
 
 fn session_activity() -> Result<String> {
@@ -394,8 +495,15 @@ fn session_activity() -> Result<String> {
 }
 
 fn tmux_stdout<const N: usize>(args: [&str; N]) -> Result<Vec<u8>> {
+    tmux_stdout_args(&args)
+}
+
+fn tmux_stdout_args<T>(args: &[T]) -> Result<Vec<u8>>
+where
+    T: AsRef<OsStr> + Debug,
+{
     let output = Command::new("tmux")
-        .args(args)
+        .args(args.iter().map(AsRef::as_ref))
         .output()
         .with_context(|| format!("failed to spawn tmux with args {:?}", args))?;
 
@@ -447,16 +555,34 @@ fn tmux_success<const N: usize>(args: [&str; N]) -> Result<()> {
     tmux_output(args).map(|_| ())
 }
 
+fn tmux_success_args<T>(args: &[T]) -> Result<()>
+where
+    T: AsRef<OsStr> + Debug,
+{
+    tmux_stdout_args(args).map(|_| ())
+}
+
 fn prompt_for_label_input_command(quoted_path: &str) -> String {
     format!(r#"run-shell "printf '%s' #{{q:%%%}} > {quoted_path}""#)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{io::Write, time::Duration};
+
+    #[cfg(unix)]
+    use std::{process::Command, time::Instant};
+
+    use anyhow::Result;
+    use tempfile::NamedTempFile;
+
     use super::{
-        CopyModeJumpCommand, copy_mode_movement_commands, parse_prompt_content,
-        prompt_for_label_input_command, rebased_scroll_position, shell_quote,
-        trim_single_trailing_newline,
+        CopyModeJumpCommand, MAX_INITIAL_CHAR_FILE_BYTES, PROMPT_FAST_POLL_INTERVAL,
+        PROMPT_FAST_POLL_WINDOW, PROMPT_IDLE_POLL_INTERVAL, PROMPT_RESPONSIVE_POLL_INTERVAL,
+        PROMPT_RESPONSIVE_POLL_WINDOW, capture_range, copy_mode_movement_args,
+        copy_mode_movement_commands, parse_prompt_content, parse_single_char_content,
+        prompt_for_label_input_command, prompt_poll_interval, read_bounded_utf8_file,
+        rebased_scroll_position, shell_quote, trim_single_trailing_newline, wait_for_char_file,
     };
 
     use crate::jump::JumpTarget;
@@ -503,6 +629,112 @@ mod tests {
     }
 
     #[test]
+    fn prompt_polling_is_fast_for_immediate_input_then_backs_off() {
+        assert_eq!(
+            prompt_poll_interval(Duration::ZERO),
+            PROMPT_FAST_POLL_INTERVAL
+        );
+        assert_eq!(
+            prompt_poll_interval(PROMPT_FAST_POLL_WINDOW - Duration::from_nanos(1)),
+            PROMPT_FAST_POLL_INTERVAL
+        );
+        assert_eq!(
+            prompt_poll_interval(PROMPT_FAST_POLL_WINDOW),
+            PROMPT_RESPONSIVE_POLL_INTERVAL
+        );
+        assert_eq!(
+            prompt_poll_interval(PROMPT_RESPONSIVE_POLL_WINDOW - Duration::from_nanos(1)),
+            PROMPT_RESPONSIVE_POLL_INTERVAL
+        );
+        assert_eq!(
+            prompt_poll_interval(PROMPT_RESPONSIVE_POLL_WINDOW),
+            PROMPT_IDLE_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn bounded_prompt_read_rejects_oversized_files() -> Result<()> {
+        let mut temp = NamedTempFile::new()?;
+        temp.write_all(&[b'x'; MAX_INITIAL_CHAR_FILE_BYTES + 1])?;
+
+        let result =
+            read_bounded_utf8_file(&temp.path().to_string_lossy(), MAX_INITIAL_CHAR_FILE_BYTES);
+
+        assert!(matches!(result, Err(error) if error.to_string().contains("byte limit")));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_prompt_read_rejects_invalid_utf8() -> Result<()> {
+        let mut temp = NamedTempFile::new()?;
+        temp.write_all(&[0xff])?;
+
+        let result =
+            read_bounded_utf8_file(&temp.path().to_string_lossy(), MAX_INITIAL_CHAR_FILE_BYTES);
+
+        assert!(matches!(result, Err(error) if error.to_string().contains("valid UTF-8")));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_prompt_read_rejects_non_regular_files() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let result = read_bounded_utf8_file(
+            &temp_dir.path().to_string_lossy(),
+            MAX_INITIAL_CHAR_FILE_BYTES,
+        );
+
+        assert!(matches!(result, Err(error) if error.to_string().contains("not a regular file")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_prompt_read_rejects_fifo_without_blocking() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let fifo = temp_dir.path().join("prompt-fifo");
+        let status = Command::new("mkfifo").arg(&fifo).status()?;
+        assert!(status.success());
+
+        let started_at = Instant::now();
+        let result = read_bounded_utf8_file(&fifo.to_string_lossy(), MAX_INITIAL_CHAR_FILE_BYTES);
+
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+        assert!(matches!(result, Err(error) if error.to_string().contains("not a regular file")));
+        Ok(())
+    }
+
+    #[test]
+    fn initial_char_parser_rejects_control_characters() {
+        for content in ["\t", "\u{1b}", "\u{7f}"] {
+            assert!(parse_single_char_content(content).is_err());
+        }
+    }
+
+    #[test]
+    fn initial_char_file_accepts_unicode_with_line_ending() -> Result<()> {
+        let mut temp = NamedTempFile::new()?;
+        temp.write_all("界\r\n".as_bytes())?;
+
+        assert_eq!(
+            wait_for_char_file(&temp.path().to_string_lossy(), None, Duration::ZERO)?,
+            Some('界')
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_initial_char_file_is_an_error_after_timeout() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let missing = temp_dir.path().join("missing-char");
+
+        let result = wait_for_char_file(&missing.to_string_lossy(), None, Duration::ZERO);
+
+        assert!(matches!(result, Err(error) if error.to_string().contains("was not found")));
+        Ok(())
+    }
+
+    #[test]
     fn copy_mode_movements_use_scroll_rows_and_columns() {
         assert_eq!(
             copy_mode_movement_commands(3, JumpTarget { row: 2, column: 5 }),
@@ -528,6 +760,52 @@ mod tests {
     }
 
     #[test]
+    fn copy_mode_movements_form_one_tmux_command_list() {
+        let commands = copy_mode_movement_commands(3, JumpTarget { row: 2, column: 5 });
+
+        assert_eq!(
+            copy_mode_movement_args("%17", &commands),
+            [
+                "send-keys",
+                "-X",
+                "-t",
+                "%17",
+                "start-of-line",
+                ";",
+                "send-keys",
+                "-X",
+                "-t",
+                "%17",
+                "top-line",
+                ";",
+                "send-keys",
+                "-X",
+                "-t",
+                "%17",
+                "-N",
+                "3",
+                "cursor-up",
+                ";",
+                "send-keys",
+                "-X",
+                "-t",
+                "%17",
+                "-N",
+                "2",
+                "cursor-down",
+                ";",
+                "send-keys",
+                "-X",
+                "-t",
+                "%17",
+                "-N",
+                "5",
+                "cursor-right",
+            ]
+        );
+    }
+
+    #[test]
     fn rebased_scroll_position_follows_new_output_into_history() {
         let pane = pane_with_scroll_and_history(4, 100);
         // No new output: the original scroll offset still holds.
@@ -537,6 +815,25 @@ mod tests {
         assert_eq!(rebased_scroll_position(&pane, 107), 11);
         // History shrank (clear-history): never underflow.
         assert_eq!(rebased_scroll_position(&pane, 0), 4);
+    }
+
+    #[test]
+    fn rebased_scroll_position_saturates_instead_of_overflowing() {
+        let pane = pane_with_scroll_and_history(usize::MAX, 0);
+        assert_eq!(rebased_scroll_position(&pane, 1), usize::MAX);
+    }
+
+    #[test]
+    fn capture_range_rejects_invalid_tmux_dimensions() {
+        assert!(capture_range(0, 0).is_err());
+        assert!(capture_range(usize::MAX, 1).is_err());
+        assert!(capture_range(0, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn capture_range_includes_exactly_the_visible_rows() -> Result<()> {
+        assert_eq!(capture_range(3, 5)?, (-3, 1));
+        Ok(())
     }
 
     fn pane_with_scroll_and_history(

@@ -72,14 +72,23 @@ where
                         return Ok(());
                     }
                     "--char" => {
+                        ensure!(jump_char.is_none(), "--char may only be specified once");
                         let value = args.next().context("missing value for --char")?;
                         jump_char = Some(parse_jump_char(value)?);
                     }
                     "--char-file" => {
+                        ensure!(
+                            jump_char_file.is_none(),
+                            "--char-file may only be specified once"
+                        );
                         jump_char_file =
                             Some(args.next().context("missing value for --char-file")?);
                     }
                     "--pane-id" => {
+                        ensure!(
+                            explicit_pane_id.is_none(),
+                            "--pane-id may only be specified once"
+                        );
                         explicit_pane_id =
                             Some(args.next().context("missing value for --pane-id")?);
                     }
@@ -129,6 +138,10 @@ fn parse_jump_char(value: String) -> Result<char> {
         chars.next().is_none(),
         "--char requires exactly one character"
     );
+    ensure!(
+        !first.is_control(),
+        "--char does not accept control characters"
+    );
     Ok(first)
 }
 
@@ -159,6 +172,13 @@ mod tests {
     #[test]
     fn parse_jump_char_allows_whitespace_characters() {
         assert!(matches!(parse_jump_char(" ".to_owned()), Ok(' ')));
+    }
+
+    #[test]
+    fn parse_jump_char_rejects_control_characters() {
+        for value in ['\n', '\t', '\u{1b}', '\u{7f}'] {
+            assert!(parse_jump_char(value.to_string()).is_err());
+        }
     }
 
     #[test]
@@ -229,5 +249,18 @@ mod tests {
     #[test]
     fn multi_character_char_value_is_rejected() {
         assert!(run(&["jump", "--char", "ab"]).is_err());
+    }
+
+    #[test]
+    fn duplicate_options_are_rejected() {
+        assert!(error_message(&["jump", "--char", "a", "--char", "b"]).contains("once"));
+        assert!(
+            error_message(&["jump", "--char-file", "/tmp/a", "--char-file", "/tmp/b",])
+                .contains("once")
+        );
+        assert!(
+            error_message(&["jump", "--char", "a", "--pane-id", "%1", "--pane-id", "%2",])
+                .contains("once")
+        );
     }
 }
