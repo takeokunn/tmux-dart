@@ -65,8 +65,17 @@ pub fn run_jump_report<B: TmuxBackend>(backend: &B, request: JumpRequest) -> Res
     } else {
         backend.current_pane_id()?
     };
-    let pane = backend.pane_state(&pane_id)?;
+    let mut pane = backend.pane_state(&pane_id)?;
     backend.cancel_copy_mode(&pane)?;
+    if pane.in_copy_mode {
+        // In copy mode, cursor_x/cursor_y describe the copy cursor, not where
+        // the application left its cursor. Keep the pre-cancel scroll and
+        // history (they anchor the view the user was looking at) but re-read
+        // the cursor, which the alternate-screen restore parks the cursor on.
+        let refreshed = backend.pane_state(&pane.pane_id)?;
+        pane.cursor_y = refreshed.cursor_y;
+        pane.cursor_x = refreshed.cursor_x;
+    }
 
     machine.enter(JumpState::CaptureScreen);
     let screen = backend.capture_visible_pane(&pane)?;
@@ -190,8 +199,11 @@ fn select_position_index_from<B: TmuxBackend>(
 }
 
 fn format_jump_prompt(match_count: usize, label_depth: usize) -> String {
+    // No commas: command-prompt treats `-p` as a comma-separated list of
+    // prompts, so a comma would split this into two prompts and the second
+    // would swallow an extra keypress before the callback ever ran.
     let match_label = if match_count == 1 { "match" } else { "matches" };
-    format!("jump key ({match_count} {match_label}, depth {label_depth}):")
+    format!("jump key ({match_count} {match_label} / depth {label_depth}):")
 }
 
 #[cfg(test)]
@@ -329,7 +341,7 @@ mod tests {
         assert_eq!(backend.writes.borrow().len(), 3);
         assert_eq!(
             backend.prompts_seen.borrow().as_slice(),
-            ["jump key (4 matches, depth 1):"]
+            ["jump key (4 matches / depth 1):"]
         );
         assert!(
             backend
@@ -357,7 +369,7 @@ mod tests {
 
         assert_eq!(
             backend.prompts_seen.borrow().as_slice(),
-            ["jump key (4 matches, depth 1):"]
+            ["jump key (4 matches / depth 1):"]
         );
         Ok(())
     }
@@ -388,8 +400,8 @@ mod tests {
         assert_eq!(
             backend.prompts_seen.borrow().as_slice(),
             [
-                "jump key (10 matches, depth 2):",
-                "jump key (9 matches, depth 1):"
+                "jump key (10 matches / depth 2):",
+                "jump key (9 matches / depth 1):"
             ]
         );
         // Each overlay is bracketed by alternate-screen enter/restore writes.

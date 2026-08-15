@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-08-15
+
+### Fixed
+
+- The key binding delivers the typed character again. The prompt template substituted the response through `#{q:%%%}`, which `run-shell` format-expanded to an empty string, so pressing the jump key silently did nothing. The response now travels through a tmux buffer (`set-buffer`/`save-buffer`) and reaches the plugin via `--char-file`, which also makes shell-hostile characters (`'`, `"`, `;`, `#`, `$`, `\`, space) jumpable.
+- Label selection works again for multi-match jumps. The label prompt used the same broken `run-shell` substitution, so every multi-match jump hung for the full prompt timeout and then cancelled; it now uses the same buffer-based delivery.
+- The label prompt no longer splits in two: `command-prompt -p` treats commas as a prompt-list separator, so the previous "jump key (N matches, depth D):" prompt swallowed one extra keypress per selection. The prompt now avoids commas.
+- Answering the label prompt no longer races the session-activity cancellation check: after an activity change the prompt file is re-read for a short grace period, so a valid selection arriving milliseconds after the keypress is not discarded as a dismissal.
+- The label prompt client is spawned instead of awaited, restoring the selection timeout: a client-less `command-prompt` blocks until answered, which previously kept the overlay up forever when the prompt was abandoned and then jumped against a long-stale capture on the next keypress.
+- Submitting an empty prompt response with Enter (which tmux delivers as a lone carriage return) is treated as a cancellation instead of a control-character error.
+- Each tmux server gets its own jump-character file, so concurrent servers no longer overwrite or delete each other's prompt input.
+- Messages shown via `display-message` escape `#`, so a jump character like `#` cannot be format-expanded into garbage.
+- When a jump starts from copy mode, the cursor position is re-read after leaving copy mode, so the alternate-screen restore parks the cursor where the application left it instead of on the copy-mode cursor.
+
+### Added
+
+- Real-tmux end-to-end coverage for the full key-binding flow (including shell-hostile characters) and for label selection and prompt dismissal, driven through a genuinely attached client.
+
 ## [0.1.8] - 2026-07-26
 
 ### Changed
