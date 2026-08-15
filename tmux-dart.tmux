@@ -75,19 +75,51 @@ run_jump_with_char() {
   run_tmux_dart_jump --char "$1"
 }
 
+run_jump_with_char_file() {
+  if [ "$#" -ne 1 ] || [ -z "$1" ]; then
+    tmux display-message "tmux-dart: missing jump character file"
+    exit 1
+  fi
+
+  run_tmux_dart_jump --char-file "$1"
+  rm -f -- "$1"
+}
+
+char_file_path() {
+  local dir="${TMPDIR:-/tmp}/tmux-dart-$(id -u)"
+  local server_pid
+
+  mkdir -p -m 700 "$dir"
+  chmod 700 "$dir"
+  # Scope the file to this tmux server: concurrent servers (or test runs)
+  # sharing one path would overwrite and delete each other's characters.
+  server_pid="$(tmux display-message -p '#{pid}')"
+  printf '%s' "$dir/jump-char-$server_pid"
+}
+
 install_key_binding() {
   local jump_key
-  local quoted_script
+  local char_file
 
   jump_key="$(get_tmux_option "@jump-key" "j")"
-  printf -v quoted_script '%q' "$CURRENT_DIR/tmux-dart.tmux"
+  char_file="$(char_file_path)"
+  # The typed character travels through tmux buffers, never through a shell or
+  # a format expansion: `%%%` backslash-escapes `"` `\` `$` `;` `~` for the
+  # double-quoted re-parse, set-buffer/save-buffer write the raw byte(s) to the
+  # file, and only then does run-shell start this script with the (safe) file
+  # path. Substituting the response directly into a shell command broke on
+  # quotes, semicolons, and hashes.
   tmux bind-key -N "Jump to pane location in copy mode" "$jump_key" \
-    command-prompt -1 -p 'char:' "run-shell -b \"$quoted_script --char #{q:%%%}\""
+    command-prompt -1 -p 'char:' \
+    "set-buffer -b tmux-dart-char -- \"%%%\" ; save-buffer -b tmux-dart-char '$char_file' ; delete-buffer -b tmux-dart-char ; run-shell -b \"'$CURRENT_DIR/tmux-dart.tmux' --char-file '$char_file'\""
 }
 
 case "${1:-}" in
   --char)
     run_jump_with_char "${2:-}"
+    ;;
+  --char-file)
+    run_jump_with_char_file "${2:-}"
     ;;
   "")
     if [ -z "${TMUX_DART_BINARY:-}" ]; then

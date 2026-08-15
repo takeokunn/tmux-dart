@@ -23,6 +23,14 @@ const PROMPT_RESPONSIVE_POLL_WINDOW: Duration = Duration::from_secs(1);
 const PROMPT_FAST_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PROMPT_RESPONSIVE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PROMPT_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const LABEL_PROMPT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long to keep re-reading the prompt file after a session-activity change
+/// before treating the prompt as dismissed. The keypress that answers the
+/// prompt bumps `session_activity` first and the prompt callback writes the
+/// file a few milliseconds later, so cancelling on the activity change alone
+/// would randomly discard valid selections.
+const PROMPT_CANCEL_GRACE: Duration = Duration::from_millis(350);
+const PROMPT_CANCEL_GRACE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone)]
 pub struct PaneState {
@@ -101,7 +109,9 @@ pub fn current_pane_id() -> Result<String> {
 }
 
 pub fn display_message(message: &str) -> Result<()> {
-    tmux_success(["display-message", message])
+    // display-message expands its argument as a format; double `#` so a user
+    // supplied jump character such as '#' cannot start a format sequence.
+    tmux_success(["display-message", &message.replace('#', "##")])
 }
 
 pub fn pane_state(pane_id: &str) -> Result<PaneState> {
@@ -200,7 +210,10 @@ pub fn cancel_copy_mode(pane: &PaneState) -> Result<()> {
 }
 
 pub fn read_initial_char_from_file(path: &str) -> Result<Option<char>> {
-    wait_for_char_file(path, None, Duration::from_secs(10))
+    // The key binding writes the file (via save-buffer) before run-shell
+    // starts this process, so the content is already complete: read it once
+    // instead of polling.
+    wait_for_char_file(path, None, Duration::ZERO)
 }
 
 fn wait_for_char_file(
@@ -261,16 +274,42 @@ pub fn prompt_for_label_input(prompt: &str) -> Result<Option<String>> {
     let path = temp.path().to_string_lossy().into_owned();
     let quoted_path = shell_quote(&path);
 
-    tmux_success([
-        "command-prompt",
-        "-1",
-        "-p",
-        prompt,
-        &prompt_for_label_input_command(&quoted_path),
-    ])?;
+    // Spawn rather than wait: a client-less `tmux command-prompt` blocks until
+    // the prompt is answered, so waiting on it would disable the timeout below
+    // and leave the overlay up forever when the user walks away — and then
+    // execute a jump against a long-stale capture on their next keypress.
+    let mut prompt_client = Command::new("tmux")
+        .args([
+            "command-prompt",
+            "-1",
+            "-p",
+            prompt,
+            &prompt_for_label_input_command(&quoted_path),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("failed to spawn tmux command-prompt")?;
+    // An open prompt keeps the client running, so an early exit with a failure
+    // status means the prompt could not be shown at all (for example no
+    // attached client); surface that instead of polling into the timeout.
+    thread::sleep(Duration::from_millis(50));
+    if let Some(status) = prompt_client
+        .try_wait()
+        .context("failed to check tmux command-prompt")?
+        && !status.success()
+    {
+        bail!("tmux command-prompt failed with {status}");
+    }
     let previous_activity = session_activity()?;
 
-    wait_for_prompt_file(&path, Some(&previous_activity), Duration::from_secs(10))
+    let input = wait_for_prompt_file(&path, Some(&previous_activity), LABEL_PROMPT_TIMEOUT);
+    // Reap the client if the prompt already resolved; if it is still open
+    // (timeout path), leave it running — the eventual response only writes a
+    // file nobody reads, which is safer than jumping on stale state.
+    let _ = prompt_client.try_wait();
+    input
 }
 
 fn wait_for_prompt_file(
@@ -289,7 +328,7 @@ fn wait_for_prompt_file(
         }
 
         if session_activity_changed(previous_activity, &mut next_activity_check)? {
-            return Ok(None);
+            return grace_reread_prompt_file(path);
         }
 
         if Instant::now() >= deadline {
@@ -297,6 +336,23 @@ fn wait_for_prompt_file(
         }
 
         sleep_until_next_prompt_poll(started_at, deadline);
+    }
+}
+
+/// A session-activity change means the user pressed *some* key: either the
+/// prompt was dismissed (no file will ever appear) or it was answered and the
+/// callback is about to write the file. Keep reading for a short grace period
+/// so a valid selection is never discarded by that race.
+fn grace_reread_prompt_file(path: &str) -> Result<Option<String>> {
+    let deadline = Instant::now() + PROMPT_CANCEL_GRACE;
+    loop {
+        if let Some(input) = read_prompt_input_from_file(path)? {
+            return Ok(Some(input));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(PROMPT_CANCEL_GRACE_POLL_INTERVAL);
     }
 }
 
@@ -390,6 +446,10 @@ fn strip_optional_line_ending(content: &str) -> &str {
     if let Some(stripped) = content.strip_suffix("\r\n") {
         stripped
     } else if let Some(stripped) = content.strip_suffix('\n') {
+        stripped
+    } else if let Some(stripped) = content.strip_suffix('\r') {
+        // Submitting an empty `command-prompt -1` response with Enter delivers
+        // a lone carriage return; treat it like an empty response, not input.
         stripped
     } else {
         content
@@ -562,8 +622,19 @@ where
     tmux_stdout_args(args).map(|_| ())
 }
 
+/// Template run by `command-prompt` with the label response. The response
+/// travels through a tmux buffer, never through a shell or a format
+/// expansion: `%%%` backslash-escapes `"` `\` `$` `;` `~` for the
+/// double-quoted re-parse, and set-buffer/save-buffer write the raw bytes to
+/// the prompt file. Substituting the response into a `run-shell` command
+/// broke on quotes and semicolons (shell/tmux parse errors) and on `#`
+/// (run-shell expands its argument as a format), which made label selection
+/// silently deliver an empty response.
 fn prompt_for_label_input_command(quoted_path: &str) -> String {
-    format!(r#"run-shell "printf '%s' #{{q:%%%}} > {quoted_path}""#)
+    let buffer = format!("tmux-dart-label-{}", std::process::id());
+    format!(
+        r#"set-buffer -b {buffer} -- "%%%" ; save-buffer -b {buffer} {quoted_path} ; delete-buffer -b {buffer}"#
+    )
 }
 
 #[cfg(test)]
@@ -601,11 +672,28 @@ mod tests {
     }
 
     #[test]
-    fn prompt_for_label_input_command_escapes_prompt_input() {
+    fn prompt_for_label_input_command_routes_response_through_a_buffer() {
+        let command = prompt_for_label_input_command("'/tmp/path'");
+        let buffer = format!("tmux-dart-label-{}", std::process::id());
+
+        // The response must be substituted inside a double-quoted set-buffer
+        // argument (`%%%` escapes for that context) and written by save-buffer,
+        // never substituted into a shell command or a format expansion.
         assert_eq!(
-            prompt_for_label_input_command("' /tmp/path '"),
-            r#"run-shell "printf '%s' #{q:%%%} > ' /tmp/path '""#
+            command,
+            format!(
+                r#"set-buffer -b {buffer} -- "%%%" ; save-buffer -b {buffer} '/tmp/path' ; delete-buffer -b {buffer}"#
+            )
         );
+        assert!(!command.contains("run-shell"));
+        assert!(!command.contains("#{"));
+    }
+
+    #[test]
+    fn parse_prompt_content_treats_lone_carriage_return_as_empty() {
+        // `command-prompt -1` submitted with Enter delivers "\r".
+        assert!(matches!(parse_prompt_content("\r"), Ok(None)));
+        assert!(matches!(parse_single_char_content("\r"), Ok(None)));
     }
 
     #[test]

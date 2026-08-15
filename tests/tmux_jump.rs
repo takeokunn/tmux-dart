@@ -522,3 +522,333 @@ fn trim_trailing_ws(screen: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// A tmux server with a real attached client, built by nesting: an outer
+/// detached server hosts one pane whose command attaches to the inner server.
+/// Keys sent to the outer pane arrive at the inner client exactly like real
+/// keyboard input, which lets these tests drive `command-prompt` — the part of
+/// the flow a detached server cannot exercise.
+struct AttachedServer {
+    dir: TempDir,
+}
+
+impl AttachedServer {
+    /// Outer 100x30 server whose single pane attaches to an inner server; the
+    /// inner session's pane prints `content` (via `printf %b`) and stays alive.
+    fn start(content: &str) -> Result<(Self, String)> {
+        let dir = tempfile::tempdir().context("create temp dir for tmux sockets")?;
+        let server = AttachedServer { dir };
+        let inner_pane_command =
+            format!("printf %b {}; exec sleep 3600", shell_single_quote(content));
+        // TMUX_DART_BINARY in the inner server's environment lets the plugin
+        // script skip its nix build and is inherited by run-shell children.
+        let outer_pane_command = format!(
+            "TMUX_DART_BINARY={BIN} exec tmux -S {} -f /dev/null new-session -x 90 -y 25 {}",
+            server.inner_socket()?,
+            shell_single_quote(&inner_pane_command),
+        );
+        server.outer(&[
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "30",
+            &outer_pane_command,
+        ])?;
+
+        for _ in 0..100 {
+            if Command::new("tmux")
+                .args(["-S", &server.inner_socket()?, "list-sessions"])
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        let pane = server.inner(&["display-message", "-p", "-F", "#{pane_id}"])?;
+        for _ in 0..100 {
+            let captured = server.inner(&["capture-pane", "-p", "-t", &pane])?;
+            if captured.chars().any(|ch| !ch.is_whitespace()) {
+                break;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        Ok((server, pane))
+    }
+
+    fn outer_socket(&self) -> Result<String> {
+        socket_path(&self.dir, "outer")
+    }
+
+    fn inner_socket(&self) -> Result<String> {
+        socket_path(&self.dir, "inner")
+    }
+
+    fn outer(&self, args: &[&str]) -> Result<String> {
+        run_tmux(&self.outer_socket()?, args)
+    }
+
+    fn inner(&self, args: &[&str]) -> Result<String> {
+        run_tmux(&self.inner_socket()?, args)
+    }
+
+    /// Env for processes that must talk to the inner server via bare `tmux`.
+    fn inner_tmux_env(&self) -> Result<String> {
+        let pid = self.inner(&["display-message", "-p", "-F", "#{pid}"])?;
+        Ok(format!("{},{pid},0", self.inner_socket()?))
+    }
+
+    /// Install the plugin key binding by running `tmux-dart.tmux` with no
+    /// arguments, exactly as `run-shell tmux-dart.tmux` would on plugin load.
+    fn install_binding(&self) -> Result<()> {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tmux-dart.tmux");
+        let output = Command::new("bash")
+            .arg(script)
+            .env("TMUX", self.inner_tmux_env()?)
+            .env("TMUX_DART_BINARY", BIN)
+            .output()
+            .context("run tmux-dart.tmux to install the key binding")?;
+        if !output.status.success() {
+            bail!(
+                "tmux-dart.tmux failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// Send keys to the inner client through the outer pane.
+    fn type_keys(&self, keys: &[&str]) -> Result<()> {
+        let mut args = vec!["send-keys", "-t", "0"];
+        args.extend_from_slice(keys);
+        self.outer(&args)?;
+        Ok(())
+    }
+
+    /// Wait until the inner client's screen (rendered in the outer pane)
+    /// contains `needle` — used to await prompts before answering them.
+    fn wait_for_display(&self, needle: &str) -> Result<()> {
+        for _ in 0..100 {
+            if self
+                .outer(&["capture-pane", "-p", "-t", "0"])?
+                .contains(needle)
+            {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(50));
+        }
+        bail!("timed out waiting for {needle:?} on the attached client");
+    }
+
+    /// Wait until the pane is in copy mode *and* the copy cursor sits on
+    /// `expect`. Entering copy mode and sending the movement commands are
+    /// separate tmux commands with a subprocess between them, so sampling the
+    /// cursor the moment `pane_in_mode` flips races the movement under load.
+    fn wait_for_jump(&self, pane: &str, expect: (i64, i64)) -> Result<()> {
+        let mut last = None;
+        for _ in 0..100 {
+            if self.inner(&["display-message", "-p", "-t", pane, "-F", "#{pane_in_mode}"])? == "1" {
+                let cursor = self.copy_cursor(pane)?;
+                if cursor == expect {
+                    return Ok(());
+                }
+                last = Some(cursor);
+            }
+            sleep(Duration::from_millis(50));
+        }
+        bail!("timed out waiting for jump to {expect:?} in pane {pane}; last cursor {last:?}");
+    }
+
+    fn copy_cursor(&self, pane: &str) -> Result<(i64, i64)> {
+        let x = self.inner(&[
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "-F",
+            "#{copy_cursor_x}",
+        ])?;
+        let y = self.inner(&[
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "-F",
+            "#{copy_cursor_y}",
+        ])?;
+        Ok((parse_i64(&x)?, parse_i64(&y)?))
+    }
+}
+
+impl Drop for AttachedServer {
+    fn drop(&mut self) {
+        for socket in ["outer", "inner"] {
+            if let Ok(path) = socket_path(&self.dir, socket) {
+                let _ = Command::new("tmux")
+                    .args(["-S", &path, "kill-server"])
+                    .output();
+            }
+        }
+    }
+}
+
+fn socket_path(dir: &TempDir, name: &str) -> Result<String> {
+    dir.path()
+        .join(name)
+        .to_str()
+        .context("non-utf8 tmux socket path")
+        .map(str::to_owned)
+}
+
+fn run_tmux(socket: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new("tmux")
+        .arg("-S")
+        .arg(socket)
+        .args(args)
+        .output()
+        .context("spawn tmux")?;
+    if !output.status.success() {
+        bail!(
+            "tmux {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches('\n')
+        .to_owned())
+}
+
+/// Drive the complete plugin flow — key binding, char prompt, buffer-based
+/// response delivery, run-shell, binary — and assert the copy cursor.
+fn assert_binding_flow(content: &str, char_keys: &[&str], expect: (i64, i64)) -> Result<()> {
+    let (server, pane) = AttachedServer::start(content)?;
+    server.install_binding()?;
+    server.type_keys(&["C-b", "j"])?;
+    server.wait_for_display("char:")?;
+    server.type_keys(char_keys)?;
+    server
+        .wait_for_jump(&pane, expect)
+        .with_context(|| format!("binding flow for {char_keys:?} in {content:?}"))?;
+    Ok(())
+}
+
+#[test]
+fn key_binding_flow_jumps_via_the_char_prompt() -> Result<()> {
+    require_tmux!();
+    // The regression that motivated this test: the prompt response used to be
+    // substituted into a run-shell command via `#{q:%%%}`, which run-shell
+    // format-expanded to an empty string, so the binding silently did nothing.
+    assert_binding_flow("hello world", &["w"], (6, 0))
+}
+
+#[test]
+fn key_binding_flow_delivers_shell_hostile_characters() -> Result<()> {
+    require_tmux!();
+    // Characters that break shell or tmux parsing when substituted into a
+    // command string; sent as hex so the outer tmux CLI cannot eat them.
+    let cases: &[(&str, &str)] = &[
+        ("a;b", "3b"),  // semicolon: tmux command separator
+        ("a#b", "23"),  // hash: format expansion
+        ("a'b", "27"),  // single quote: shell quoting
+        ("a\"b", "22"), // double quote: tmux quoting
+    ];
+    for (content, hex) in cases {
+        assert_binding_flow(content, &["-H", hex], (1, 0))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn label_selection_flow_jumps_to_the_chosen_target() -> Result<()> {
+    require_tmux!();
+    let (server, pane) = AttachedServer::start("qone qtwo qthree qfour")?;
+    let mut child = Command::new(BIN)
+        .args(["jump", "--char", "q", "--pane-id", &pane])
+        .env("TMUX", server.inner_tmux_env()?)
+        .spawn()
+        .context("spawn tmux-dart for label selection")?;
+
+    server.wait_for_display("jump key (4 matches")?;
+    server.type_keys(&["f"])?;
+
+    let status = wait_child(&mut child, Duration::from_secs(10))?;
+    assert!(status.success(), "label selection run failed");
+    assert!(
+        server.inner(&[
+            "display-message",
+            "-p",
+            "-t",
+            &pane,
+            "-F",
+            "#{pane_in_mode}"
+        ])? == "1"
+    );
+    // Label 'f' is the second target: "qtwo" starts at column 5.
+    assert_eq!(server.copy_cursor(&pane)?, (5, 0));
+    Ok(())
+}
+
+#[test]
+fn label_selection_flow_cancels_on_prompt_dismissal() -> Result<()> {
+    require_tmux!();
+    let (server, pane) = AttachedServer::start("qone qtwo qthree qfour")?;
+    let mut child = Command::new(BIN)
+        .args(["jump", "--char", "q", "--pane-id", &pane])
+        .env("TMUX", server.inner_tmux_env()?)
+        .spawn()
+        .context("spawn tmux-dart for label selection")?;
+
+    server.wait_for_display("jump key (4 matches")?;
+    server.type_keys(&["Escape"])?;
+    // session_activity has one-second resolution: a later keypress guarantees
+    // the dismissal becomes observable to the polling binary.
+    sleep(Duration::from_millis(1100));
+    server.type_keys(&["x"])?;
+
+    let status = wait_child(&mut child, Duration::from_secs(10))?;
+    assert!(
+        status.success(),
+        "cancelled label selection must exit cleanly"
+    );
+    assert_eq!(
+        server.inner(&[
+            "display-message",
+            "-p",
+            "-t",
+            &pane,
+            "-F",
+            "#{pane_in_mode}"
+        ])?,
+        "0",
+        "a dismissed label prompt must not enter copy mode"
+    );
+    assert!(
+        server.inner(&["show-messages"])?.contains("jump cancelled"),
+        "a dismissed label prompt must report the cancellation"
+    );
+    Ok(())
+}
+
+fn wait_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("wait for tmux-dart child")? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("tmux-dart child did not exit within {timeout:?}");
+        }
+        sleep(Duration::from_millis(50));
+    }
+}
